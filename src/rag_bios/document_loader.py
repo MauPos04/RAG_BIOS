@@ -1,4 +1,7 @@
 import os
+import logging
+from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -7,7 +10,15 @@ from openpyxl import load_workbook
 from unstructured.partition.auto import partition
 
 
+LOGGER = logging.getLogger(__name__)
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".xlsx"}
+
+
+@dataclass(slots=True)
+class DocumentLoadResult:
+    documents: list[Document]
+    processed_files: list[str]
+    warnings: list[str]
 
 
 def save_uploaded_file(uploaded_file) -> Path:
@@ -17,21 +28,42 @@ def save_uploaded_file(uploaded_file) -> Path:
         return Path(temp_file.name)
 
 
-def load_uploaded_documents(uploaded_files) -> list[Document]:
+def load_uploaded_documents(uploaded_files) -> DocumentLoadResult:
     documents: list[Document] = []
+    processed_files: list[str] = []
+    warnings: list[str] = []
     temp_paths: list[Path] = []
 
     try:
         for uploaded_file in uploaded_files:
             temp_path = save_uploaded_file(uploaded_file)
             temp_paths.append(temp_path)
-            documents.extend(load_file(temp_path, uploaded_file.name))
+
+            try:
+                loaded_documents = load_file(temp_path, uploaded_file.name)
+            except Exception as exc:
+                LOGGER.exception("No se pudo procesar el archivo %s", uploaded_file.name)
+                warnings.append(f"No pude procesar {uploaded_file.name}: {exc}")
+                continue
+
+            if not loaded_documents:
+                warnings.append(
+                    f"Omiti {uploaded_file.name} porque no extraje contenido util para indexar."
+                )
+                continue
+
+            documents.extend(loaded_documents)
+            processed_files.append(uploaded_file.name)
     finally:
         for temp_path in temp_paths:
             if temp_path.exists():
                 os.remove(temp_path)
 
-    return documents
+    return DocumentLoadResult(
+        documents=documents,
+        processed_files=processed_files,
+        warnings=warnings,
+    )
 
 
 def load_file(file_path: Path, display_name: str | None = None) -> list[Document]:
@@ -70,28 +102,100 @@ def _load_xlsx(file_path: Path, source_name: str) -> list[Document]:
     workbook = load_workbook(filename=file_path, data_only=True, read_only=True)
     documents: list[Document] = []
 
-    for sheet in workbook.worksheets:
-        rows: list[str] = []
-        for row_index, row in enumerate(sheet.iter_rows(values_only=True), start=1):
-            values = [str(value).strip() for value in row if value is not None and str(value).strip()]
-            if not values:
+    try:
+        for sheet in workbook.worksheets:
+            populated_rows = [
+                (row_index, [_normalize_cell(value) for value in row])
+                for row_index, row in enumerate(sheet.iter_rows(values_only=True), start=1)
+            ]
+            populated_rows = [
+                (row_index, values)
+                for row_index, values in populated_rows
+                if any(values)
+            ]
+
+            if not populated_rows:
                 continue
-            rows.append(f"Fila {row_index}: " + " | ".join(values))
 
-        if not rows:
-            continue
+            uses_header_row = len(populated_rows) >= 2
+            header_row = populated_rows[0][1] if uses_header_row else []
+            data_rows = populated_rows[1:] if uses_header_row else populated_rows
+            header_names = _build_header_names(header_row, data_rows)
 
-        content = f"Hoja: {sheet.title}\n" + "\n".join(rows)
-        documents.append(
-            Document(
-                page_content=content,
-                metadata={
-                    "source": source_name,
-                    "sheet_name": sheet.title,
-                    "file_type": "xlsx",
-                },
-            )
-        )
+            for row_index, values in data_rows:
+                row_pairs = []
+                date_aliases = []
+                row_data: dict[str, str] = {}
+                for column_index, value in enumerate(values, start=1):
+                    if not value:
+                        continue
+                    header_name = _header_name_for_column(header_names, column_index)
+                    row_pairs.append(f"{header_name}: {value}")
+                    row_data[header_name] = value
+                    if header_name.strip().lower() == "date":
+                        date_aliases.append(f"Fecha: {value}")
 
-    workbook.close()
+                if not row_pairs:
+                    continue
+
+                content = "\n".join(
+                    [f"Hoja: {sheet.title}", f"Fila: {row_index}", *date_aliases, *row_pairs]
+                )
+                documents.append(
+                    Document(
+                        page_content=content,
+                        metadata={
+                            "source": source_name,
+                            "sheet_name": sheet.title,
+                            "row_number": row_index,
+                            "file_type": "xlsx",
+                            "column_names": header_names,
+                            "row_data": row_data,
+                            "date_value": row_data.get("Date") or row_data.get("date"),
+                        },
+                    )
+                )
+    finally:
+        workbook.close()
+
     return documents
+
+
+def _normalize_cell(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    text = str(value).strip()
+    return text
+
+
+def _build_header_names(
+    header_row: list[str],
+    data_rows: list[tuple[int, list[str]]],
+) -> list[str]:
+    max_columns = max(
+        [len(header_row), *[len(values) for _, values in data_rows]],
+        default=0,
+    )
+    unique_headers: list[str] = []
+    seen_headers: dict[str, int] = {}
+
+    for column_index in range(1, max_columns + 1):
+        raw_header = header_row[column_index - 1].strip() if column_index <= len(header_row) else ""
+        header_name = raw_header or f"col_{column_index}"
+        duplicate_index = seen_headers.get(header_name, 0)
+        if duplicate_index:
+            header_name = f"{header_name}_{duplicate_index + 1}"
+        seen_headers[raw_header or f"col_{column_index}"] = duplicate_index + 1
+        unique_headers.append(header_name)
+
+    return unique_headers
+
+
+def _header_name_for_column(header_names: list[str], column_index: int) -> str:
+    if column_index <= len(header_names):
+        return header_names[column_index - 1]
+    return f"col_{column_index}"

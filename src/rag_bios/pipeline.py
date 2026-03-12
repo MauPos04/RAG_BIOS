@@ -1,8 +1,11 @@
+import logging
 import os
+import re
+from dataclasses import dataclass, field
+from functools import lru_cache
+from time import perf_counter
 
 os.environ["LOKY_MAX_CPU_COUNT"] = "1"
-
-from dataclasses import dataclass
 
 from langchain_community.vectorstores import FAISS
 from langchain_community.vectorstores.utils import DistanceStrategy
@@ -17,10 +20,29 @@ from .config import Settings
 from .prompts import GROUNDING_PROMPT
 
 
+LOGGER = logging.getLogger(__name__)
+ABSTENTION_ANSWER = "No encontre esa informacion en los documentos cargados."
+CITATION_PATTERN = re.compile(r"\[(E\d+)\]")
+DATE_PATTERN = re.compile(r"\b(\d{4}[-/]\d{2}[-/]\d{2})\b")
+ROW_PATTERN = re.compile(r"\bfila\s+(\d+)\b", re.IGNORECASE)
+VALUE_LOOKUP_TERMS = ("cual", "cuál", "valor", "dato", "dime", "muestra", "muéstrame")
+
+
 @dataclass(slots=True)
 class RetrievalResult:
     answer: str
     evidence: list[dict]
+    warnings: list[str] = field(default_factory=list)
+    diagnostics: dict = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class StructuredSelection:
+    matches: list[tuple[Document, float]] = field(default_factory=list)
+    matched_columns: list[str] = field(default_factory=list)
+    matched_dates: list[str] = field(default_factory=list)
+    matched_rows: list[int] = field(default_factory=list)
+    exact_answer: str | None = None
 
 
 def chunk_documents(documents: list[Document], settings: Settings) -> list[Document]:
@@ -28,16 +50,31 @@ def chunk_documents(documents: list[Document], settings: Settings) -> list[Docum
         chunk_size=settings.chunk_size,
         chunk_overlap=settings.chunk_overlap,
     )
-    return splitter.split_documents(documents)
+    chunked_documents: list[Document] = []
+    for document in documents:
+        if document.metadata.get("file_type") == "xlsx":
+            chunked_documents.append(document)
+            continue
+        chunked_documents.extend(splitter.split_documents([document]))
+    return chunked_documents
 
 
-def build_vector_store(documents: list[Document], settings: Settings) -> FAISS:
-    embeddings = HuggingFaceEmbeddings(
-        model_name=settings.embedding_model,
+@lru_cache(maxsize=4)
+def _get_embeddings(model_name: str) -> HuggingFaceEmbeddings:
+    LOGGER.info("Inicializando modelo de embeddings: %s", model_name)
+    return HuggingFaceEmbeddings(
+        model_name=model_name,
         model_kwargs={"device": "cpu"},
         encode_kwargs={"normalize_embeddings": True},
         cache_folder="models_cache",
     )
+
+
+def build_vector_store(documents: list[Document], settings: Settings) -> FAISS:
+    if not documents:
+        raise ValueError("No hay contenido util para construir el indice vectorial.")
+
+    embeddings = _get_embeddings(settings.embedding_model)
     return FAISS.from_documents(
         documents=documents,
         embedding=embeddings,
@@ -45,24 +82,104 @@ def build_vector_store(documents: list[Document], settings: Settings) -> FAISS:
     )
 
 
-def answer_question(vector_store: FAISS, question: str, settings: Settings) -> RetrievalResult:
-    retrieved_pairs = vector_store.similarity_search_with_relevance_scores(
-        question,
-        k=settings.top_k,
-    )
-    filtered_pairs = [
-        (document, score)
-        for document, score in retrieved_pairs
-        if score >= settings.min_relevance_score
-    ]
+def answer_question(
+    vector_store: FAISS,
+    question: str,
+    settings: Settings,
+    source_documents: list[Document] | None = None,
+) -> RetrievalResult:
+    diagnostics = {
+        "model": settings.openrouter_model,
+        "retrieval_mode": "semantic",
+        "llm_called": False,
+    }
 
-    if not filtered_pairs:
+    structured_selection = _select_structured_xlsx_matches(
+        question,
+        source_documents or [],
+        settings.top_k,
+    )
+    if structured_selection.matches:
+        diagnostics.update(
+            {
+                "retrieval_mode": "structured_xlsx",
+                "retrieved_pairs": len(structured_selection.matches),
+                "selected_pairs": len(structured_selection.matches),
+                "matched_columns": structured_selection.matched_columns,
+                "matched_dates": structured_selection.matched_dates,
+                "matched_rows": structured_selection.matched_rows,
+            }
+        )
+        LOGGER.info(
+            "Lookup estructurado XLSX | columnas=%s | fechas=%s | filas=%s | matches=%s",
+            structured_selection.matched_columns,
+            structured_selection.matched_dates,
+            structured_selection.matched_rows,
+            len(structured_selection.matches),
+        )
+        evidence = _build_evidence(
+            structured_selection.matches,
+            metric_label="coincidencia",
+        )
+        if structured_selection.exact_answer:
+            diagnostics["citation_mode"] = "structured_exact"
+            return RetrievalResult(
+                answer=structured_selection.exact_answer,
+                evidence=evidence,
+                diagnostics=diagnostics,
+            )
+        return _answer_from_evidence(question, evidence, settings, diagnostics)
+
+    retrieval_started_at = perf_counter()
+    retrieval_k = max(settings.top_k, settings.top_k * settings.retrieval_multiplier)
+    retrieved_pairs = vector_store.similarity_search_with_score(
+        question,
+        k=retrieval_k,
+    )
+    retrieval_elapsed_ms = round((perf_counter() - retrieval_started_at) * 1000, 2)
+
+    ranked_pairs = sorted(retrieved_pairs, key=lambda item: item[1])
+    selected_pairs = ranked_pairs[: settings.top_k]
+
+    diagnostics.update(
+        {
+            "retrieval_k": retrieval_k,
+            "retrieved_pairs": len(retrieved_pairs),
+            "selected_pairs": len(selected_pairs),
+            "retrieval_metric": "distance",
+            "retrieval_distances": [round(float(score), 3) for _, score in ranked_pairs],
+            "retrieval_ms": retrieval_elapsed_ms,
+        }
+    )
+
+    LOGGER.info(
+        "Retrieval completado | modelo=%s | recuperados=%s | seleccionados=%s | distancias=%s",
+        settings.openrouter_model,
+        len(retrieved_pairs),
+        len(selected_pairs),
+        diagnostics["retrieval_distances"],
+    )
+
+    if not selected_pairs:
+        LOGGER.warning("No se recupero evidencia para la pregunta: %s", question)
+        diagnostics["citation_mode"] = "no_evidence"
         return RetrievalResult(
-            answer="No encontre esa informacion en los documentos cargados.",
+            answer=ABSTENTION_ANSWER,
             evidence=[],
+            diagnostics=diagnostics,
         )
 
-    context = "\n\n".join(document.page_content for document, _ in filtered_pairs)
+    evidence = _build_evidence(selected_pairs, metric_label="distancia")
+    return _answer_from_evidence(question, evidence, settings, diagnostics)
+
+
+def _answer_from_evidence(
+    question: str,
+    evidence: list[dict],
+    settings: Settings,
+    diagnostics: dict,
+) -> RetrievalResult:
+    context = _build_context(evidence)
     prompt = ChatPromptTemplate.from_template(GROUNDING_PROMPT)
     llm = ChatOpenAI(
         model=settings.openrouter_model,
@@ -75,29 +192,323 @@ def answer_question(vector_store: FAISS, question: str, settings: Settings) -> R
         },
     )
     chain = prompt | llm | StrOutputParser()
-    answer = chain.invoke({"context": context, "question": question})
 
+    LOGGER.info(
+        "Invocando LLM | modelo=%s | evidencia=%s",
+        settings.openrouter_model,
+        [item["id"] for item in evidence],
+    )
+    llm_started_at = perf_counter()
+    try:
+        answer = chain.invoke({"context": context, "question": question})
+    except Exception as exc:
+        LOGGER.exception("Fallo la llamada al modelo %s", settings.openrouter_model)
+        raise RuntimeError(
+            "No pude consultar el modelo configurado. Revisa la clave, el proveedor o la red."
+        ) from exc
+
+    llm_elapsed_ms = round((perf_counter() - llm_started_at) * 1000, 2)
+    diagnostics["llm_called"] = True
+    diagnostics["llm_ms"] = llm_elapsed_ms
+
+    validated_answer, cited_ids, warnings, citation_mode = _validate_citations(
+        answer,
+        evidence,
+        settings,
+    )
+    diagnostics["citation_mode"] = citation_mode
+    diagnostics["cited_ids"] = cited_ids
+
+    LOGGER.info(
+        "Respuesta validada | citation_mode=%s | cited_ids=%s | warnings=%s",
+        citation_mode,
+        cited_ids,
+        warnings,
+    )
+
+    if validated_answer == ABSTENTION_ANSWER:
+        return RetrievalResult(
+            answer=validated_answer,
+            evidence=evidence,
+            warnings=warnings,
+            diagnostics=diagnostics,
+        )
+
+    cited_evidence = [item for item in evidence if item["id"] in cited_ids] or evidence
+    return RetrievalResult(
+        answer=validated_answer,
+        evidence=cited_evidence,
+        warnings=warnings,
+        diagnostics=diagnostics,
+    )
+
+
+def _select_structured_xlsx_matches(
+    question: str,
+    source_documents: list[Document],
+    top_k: int,
+) -> StructuredSelection:
+    xlsx_documents = [
+        document
+        for document in source_documents
+        if document.metadata.get("file_type") == "xlsx"
+        and isinstance(document.metadata.get("row_data"), dict)
+    ]
+    if not xlsx_documents:
+        return StructuredSelection()
+
+    query_dates = _extract_query_dates(question)
+    query_rows = _extract_query_rows(question)
+    if not query_dates and not query_rows:
+        return StructuredSelection()
+
+    available_columns = _collect_xlsx_columns(xlsx_documents)
+    matched_columns = _extract_query_columns(question, available_columns)
+
+    scored_matches: list[tuple[Document, float]] = []
+    for document in xlsx_documents:
+        row_data = document.metadata.get("row_data", {})
+        match_score = 0.0
+
+        if query_dates:
+            document_date = _normalize_date_value(document.metadata.get("date_value", ""))
+            if document_date not in query_dates:
+                continue
+            match_score += 10.0
+
+        if query_rows:
+            if document.metadata.get("row_number") not in query_rows:
+                continue
+            match_score += 8.0
+
+        if matched_columns:
+            available_matches = [column for column in matched_columns if column in row_data]
+            if not available_matches:
+                continue
+            match_score += float(len(available_matches))
+
+        if match_score <= 0:
+            continue
+        scored_matches.append((document, match_score))
+
+    if not scored_matches:
+        return StructuredSelection()
+
+    scored_matches.sort(
+        key=lambda item: (-item[1], item[0].metadata.get("row_number", 0)),
+    )
+    selected_matches = scored_matches[:top_k]
+
+    exact_answer = None
+    if len(scored_matches) == 1:
+        matched_document = scored_matches[0][0]
+        if matched_columns and _is_exact_value_lookup(question):
+            exact_answer = _build_exact_xlsx_answer(matched_document, matched_columns)
+        elif not matched_columns and _is_exact_row_lookup(question):
+            exact_answer = _build_exact_xlsx_row_answer(matched_document)
+
+    return StructuredSelection(
+        matches=selected_matches,
+        matched_columns=matched_columns,
+        matched_dates=sorted(query_dates),
+        matched_rows=sorted(query_rows),
+        exact_answer=exact_answer,
+    )
+
+
+def _collect_xlsx_columns(documents: list[Document]) -> list[str]:
+    for document in documents:
+        column_names = document.metadata.get("column_names")
+        if isinstance(column_names, list) and column_names:
+            return [str(column) for column in column_names]
+    return []
+
+
+def _extract_query_columns(question: str, available_columns: list[str]) -> list[str]:
+    question_lower = question.lower()
+    question_compact = _normalize_lookup_token(question)
+    matched_columns: list[str] = []
+
+    for column in available_columns:
+        column_lower = column.lower()
+        column_compact = _normalize_lookup_token(column)
+        column_spaced = re.sub(r"[_\W]+", " ", column_lower).strip()
+        if column_compact and column_compact in question_compact:
+            matched_columns.append(column)
+            continue
+        if column_spaced and column_spaced in question_lower:
+            matched_columns.append(column)
+
+    return matched_columns
+
+
+def _extract_query_dates(question: str) -> set[str]:
+    return {
+        _normalize_date_value(match.group(1))
+        for match in DATE_PATTERN.finditer(question)
+        if _normalize_date_value(match.group(1))
+    }
+
+
+def _extract_query_rows(question: str) -> set[int]:
+    return {
+        int(match.group(1))
+        for match in ROW_PATTERN.finditer(question)
+    }
+
+
+def _normalize_date_value(value: str) -> str:
+    normalized = value.strip().replace("/", "-")
+    return normalized if DATE_PATTERN.fullmatch(normalized) else ""
+
+
+def _normalize_lookup_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _is_exact_value_lookup(question: str) -> bool:
+    question_lower = question.lower()
+    extra_terms = ("dame", "muestrame")
+    return any(term in question_lower for term in (*VALUE_LOOKUP_TERMS, *extra_terms))
+
+
+def _is_exact_row_lookup(question: str) -> bool:
+    question_lower = question.lower()
+    row_terms = ("muestra", "muestrame", "fila", "datos", "informacion", "contenido")
+    return any(term in question_lower for term in row_terms)
+
+
+def _build_exact_xlsx_answer(document: Document, matched_columns: list[str]) -> str:
+    row_data = document.metadata.get("row_data", {})
+    date_value = document.metadata.get("date_value")
+    row_number = document.metadata.get("row_number")
+    row_label = (
+        f"la fecha {date_value}"
+        if date_value
+        else f"la fila {row_number}"
+    )
+
+    if len(matched_columns) == 1:
+        column = matched_columns[0]
+        return f"Para {row_label}, {column} es {row_data[column]} [E1]."
+
+    values = "; ".join(f"{column} = {row_data[column]}" for column in matched_columns)
+    return f"Para {row_label}: {values} [E1]."
+
+
+def _build_exact_xlsx_row_answer(document: Document) -> str:
+    row_data = document.metadata.get("row_data", {})
+    date_value = document.metadata.get("date_value")
+    row_number = document.metadata.get("row_number")
+    row_label = (
+        f"la fecha {date_value}"
+        if date_value
+        else f"la fila {row_number}"
+    )
+    values = "; ".join(f"{column} = {value}" for column, value in row_data.items())
+    return f"Para {row_label}: {values} [E1]."
+
+
+def _build_evidence(
+    selected_pairs: list[tuple[Document, float]],
+    *,
+    metric_label: str,
+) -> list[dict]:
     evidence = []
-    for document, score in filtered_pairs:
+    for index, (document, metric_value) in enumerate(selected_pairs, start=1):
         source = document.metadata.get("source", "Documento")
         location = _format_location(document.metadata)
         evidence.append(
             {
+                "id": f"E{index}",
                 "source": source,
                 "location": location,
-                "score": round(float(score), 3),
+                "metric_label": metric_label,
+                "metric_value": round(float(metric_value), 3),
                 "content": document.page_content,
             }
         )
+    return evidence
 
-    return RetrievalResult(answer=answer, evidence=evidence)
+
+def _build_context(evidence: list[dict]) -> str:
+    return "\n\n".join(
+        (
+            f"[{item['id']}] Fuente: {item['source']} | Ubicacion: {item['location']} "
+            f"| {item['metric_label'].capitalize()}: {item['metric_value']}\n{item['content']}"
+        )
+        for item in evidence
+    )
+
+
+def _validate_citations(
+    answer: str,
+    evidence: list[dict],
+    settings: Settings,
+) -> tuple[str, list[str], list[str], str]:
+    normalized_answer = answer.strip()
+    if not normalized_answer:
+        LOGGER.warning("El modelo devolvio una respuesta vacia.")
+        return ABSTENTION_ANSWER, [], [], "empty"
+
+    if normalized_answer == ABSTENTION_ANSWER:
+        return ABSTENTION_ANSWER, [], [], "abstained_by_model"
+
+    valid_ids = {item["id"] for item in evidence}
+    cited_ids = CITATION_PATTERN.findall(normalized_answer)
+    unique_valid_ids = _unique_valid_ids(cited_ids, valid_ids)
+
+    if not settings.require_citations:
+        return normalized_answer, unique_valid_ids, [], "citations_disabled"
+
+    if not cited_ids:
+        warning = "Respuesta sin citas explicitas del modelo. Revisa la evidencia recuperada."
+        LOGGER.warning(warning)
+        return normalized_answer, [], [warning], "missing"
+
+    invalid_citations = [cited_id for cited_id in cited_ids if cited_id not in valid_ids]
+    if invalid_citations:
+        cleaned_answer = CITATION_PATTERN.sub(
+            lambda match: match.group(0) if match.group(1) in valid_ids else "",
+            normalized_answer,
+        )
+        cleaned_answer = _normalize_answer_spacing(cleaned_answer) or normalized_answer
+        warning = (
+            "El modelo devolvio citas invalidas. Se muestran todos los fragmentos recuperados."
+        )
+        LOGGER.warning(
+            "%s | invalid_citations=%s",
+            warning,
+            invalid_citations,
+        )
+        return cleaned_answer, unique_valid_ids, [warning], "invalid_removed"
+
+    return normalized_answer, unique_valid_ids, [], "valid"
+
+
+def _unique_valid_ids(cited_ids: list[str], valid_ids: set[str]) -> list[str]:
+    unique_ids: list[str] = []
+    for cited_id in cited_ids:
+        if cited_id in valid_ids and cited_id not in unique_ids:
+            unique_ids.append(cited_id)
+    return unique_ids
+
+
+def _normalize_answer_spacing(answer: str) -> str:
+    compact_answer = re.sub(r"[ \t]{2,}", " ", answer)
+    compact_answer = re.sub(r"\s+\n", "\n", compact_answer)
+    compact_answer = re.sub(r"\n{3,}", "\n\n", compact_answer)
+    return compact_answer.strip()
 
 
 def _format_location(metadata: dict) -> str:
+    if "sheet_name" in metadata:
+        location_parts = [f"hoja {metadata['sheet_name']}"]
+        if "row_number" in metadata:
+            location_parts.append(f"fila {metadata['row_number']}")
+        return " | ".join(location_parts)
     if "page_number" in metadata:
         return f"pagina {metadata['page_number']}"
-    if "sheet_name" in metadata:
-        return f"hoja {metadata['sheet_name']}"
     if "element_index" in metadata:
         return f"bloque {metadata['element_index']}"
     return "fragmento"
