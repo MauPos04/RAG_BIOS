@@ -93,6 +93,46 @@ TABULAR_HINTS = (
     "low",
     "volume",
 )
+ENUMERATION_HINTS = (
+    "opciones",
+    "alternativas",
+    "situaciones",
+    "posibilidades",
+    "cuales son",
+    "tipos",
+    "derechos",
+    "casos",
+    "ejemplos",
+)
+GENERIC_ENUMERATION_TERMS = {
+    "opciones",
+    "alternativas",
+    "situaciones",
+    "posibilidades",
+    "cuales",
+    "tipos",
+    "casos",
+    "ejemplos",
+    "aparecen",
+    "aparece",
+    "documento",
+    "hay",
+    "tengo",
+}
+ENUMERATION_EXCLUDE_PREFIXES = (
+    "formato ",
+    "en cumplimiento",
+    "si usted",
+    "con el envio",
+    "el comite",
+    "firma",
+    "indique",
+    "numero de documento",
+    "nombre",
+    "correo electronico",
+    "ciudad",
+    "fecha",
+)
 
 
 @dataclass(slots=True)
@@ -358,6 +398,15 @@ def answer_question(
         )
 
     evidence = _build_evidence(selected_pairs, metric_label="distancia")
+    enumeration_answer, enumeration_evidence = _try_build_enumeration_answer(question, evidence)
+    if enumeration_answer:
+        diagnostics["citation_mode"] = "enumeration_exact"
+        diagnostics["cited_ids"] = [item["id"] for item in enumeration_evidence]
+        return RetrievalResult(
+            answer=enumeration_answer,
+            evidence=enumeration_evidence,
+            diagnostics=diagnostics,
+        )
     return _answer_from_evidence(
         question,
         evidence,
@@ -1120,6 +1169,79 @@ def _normalize_cited_output(
         remapped_evidence.append(remapped_item)
 
     return remapped_answer, remapped_evidence, list(remap.values())
+
+
+def _try_build_enumeration_answer(
+    question: str,
+    evidence: list[dict],
+) -> tuple[str | None, list[dict]]:
+    if not _is_enumeration_question(question):
+        return None, []
+
+    anchor_terms = _extract_enumeration_anchor_terms(question)
+    if not anchor_terms:
+        return None, []
+
+    candidates = _select_enumeration_candidates(evidence, anchor_terms)
+    if len(candidates) < 2:
+        return None, []
+
+    renumbered_candidates = _renumber_evidence(candidates)
+    statements = [f"{item['content']} [{item['id']}]" for item in renumbered_candidates]
+    if len(statements) == 2:
+        statement_text = " y ".join(statements)
+    else:
+        statement_text = "; ".join(statements[:-1]) + f"; y {statements[-1]}"
+
+    return (
+        f"En el documento se mencionan estas opciones: {statement_text}.",
+        renumbered_candidates,
+    )
+
+
+def _is_enumeration_question(question: str) -> bool:
+    normalized_question = _normalize_free_text(question)
+    return any(term in normalized_question for term in ENUMERATION_HINTS)
+
+
+def _extract_enumeration_anchor_terms(question: str) -> set[str]:
+    return {
+        term
+        for term in _extract_query_terms(question)
+        if term not in GENERIC_ENUMERATION_TERMS
+    }
+
+
+def _select_enumeration_candidates(evidence: list[dict], anchor_terms: set[str]) -> list[dict]:
+    selected: list[dict] = []
+    seen_contents: set[str] = set()
+
+    for item in evidence:
+        content = str(item.get("content", "")).strip()
+        normalized_content = _normalize_free_text(content)
+        if not content or normalized_content in seen_contents:
+            continue
+        if _lexical_overlap_with_terms(anchor_terms, content) <= 0:
+            continue
+        if len(content) < 12 or len(content) > 220:
+            continue
+        if "@" in content or "http" in normalized_content:
+            continue
+        if any(normalized_content.startswith(prefix) for prefix in ENUMERATION_EXCLUDE_PREFIXES):
+            continue
+        seen_contents.add(normalized_content)
+        selected.append(item)
+
+    return selected
+
+
+def _renumber_evidence(evidence: list[dict]) -> list[dict]:
+    remapped: list[dict] = []
+    for index, item in enumerate(evidence, start=1):
+        remapped_item = dict(item)
+        remapped_item["id"] = f"E{index}"
+        remapped.append(remapped_item)
+    return remapped
 
 
 def _suggest_clarifying_questions(
