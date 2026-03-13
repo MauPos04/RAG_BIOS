@@ -174,6 +174,8 @@ def _load_xlsx(file_path: Path, source_name: str) -> list[Document]:
             header_names = _build_header_names(header_row, data_rows)
 
             for row_index, values in data_rows:
+                # Keep each row intact so exact date/column questions can be answered
+                # without losing the relationship between fields during chunking.
                 row_pairs = []
                 date_aliases = []
                 row_data: dict[str, str] = {}

@@ -288,10 +288,14 @@ def answer_question(
         "chat_memory_turns": len(recent_chat_history) // 2,
     }
 
+    # Short follow-ups like "cuantas son?" should reuse the previous enumerated
+    # evidence instead of triggering a fresh retrieval that could count a subset.
     count_follow_up_result = _answer_count_follow_up(question, recent_chat_history, diagnostics)
     if count_follow_up_result is not None:
         return count_follow_up_result
 
+    # XLSX gets first pass because exact date/column queries are more reliable
+    # when answered from row metadata than from semantic similarity alone.
     structured_selection = _select_structured_xlsx_matches(
         question,
         source_documents or [],
@@ -335,6 +339,8 @@ def answer_question(
             recent_chat_history,
         )
 
+    # TXT notes can often be resolved better from section titles and commands
+    # than from the general vector index.
     structured_text_selection = _select_structured_txt_matches(
         question,
         source_documents or [],
@@ -420,6 +426,8 @@ def answer_question(
             diagnostics=diagnostics,
         )
 
+    # For list-like questions on PDF/DOCX, pull neighbor blocks before the LLM
+    # so headings like "Finalidades:" carry their contiguous items with them.
     expanded_pairs = _expand_semantic_neighbor_pairs(
         question,
         selected_pairs,
@@ -469,6 +477,7 @@ def _answer_count_follow_up(
     if len(previous_evidence) < 2:
         return None
 
+    # Reuse the previous cited evidence as the source of truth for counts.
     evidence = _renumber_evidence(previous_evidence)
     subject = _infer_count_subject(previous_user_question)
     citation_text = " ".join(f"[{item['id']}]" for item in evidence)

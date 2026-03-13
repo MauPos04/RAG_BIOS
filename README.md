@@ -54,13 +54,6 @@ RAG_BIOS/
         `-- prompts.py
 ```
 
-Documentacion complementaria:
-
-- `README2.md`: flujo del modelo y responsabilidades locales/remotas
-- `COMO_FUNCIONA.md`: explicacion detallada del funcionamiento
-- `DEMO_GUIA.md`: guion sugerido para la presentacion tecnica
-- `PREGUNTAS_PRUEBA.md`: preguntas recomendadas para validacion funcional
-
 ## Instrucciones de ejecucion
 
 1. Crear entorno virtual con Python 3.12 o superior.
@@ -70,12 +63,24 @@ Documentacion complementaria:
 uv venv
 ```
 
-3. Activar el entorno virtual.
+3. Activar el entorno virtual segun el sistema operativo.
 
 En Windows PowerShell:
 
 ```bash
 .venv\Scripts\activate
+```
+
+En macOS:
+
+```bash
+source .venv/bin/activate
+```
+
+En Linux:
+
+```bash
+source .venv/bin/activate
 ```
 
 4. Instalar dependencias bloqueadas por `uv.lock`:
