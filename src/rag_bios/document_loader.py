@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -12,6 +13,8 @@ from unstructured.partition.auto import partition
 
 LOGGER = logging.getLogger(__name__)
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".xlsx"}
+TEXT_ENCODINGS = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
+TXT_HEADING_PATTERN = re.compile(r"^\d+[.)]\s+")
 
 
 @dataclass(slots=True)
@@ -21,6 +24,13 @@ class DocumentLoadResult:
     warnings: list[str]
 
 
+@dataclass(slots=True)
+class TxtSection:
+    content: str
+    title: str | None
+    command_lines: list[str]
+
+
 def save_uploaded_file(uploaded_file) -> Path:
     suffix = Path(uploaded_file.name).suffix.lower()
     with NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
@@ -28,7 +38,7 @@ def save_uploaded_file(uploaded_file) -> Path:
         return Path(temp_file.name)
 
 
-def load_uploaded_documents(uploaded_files) -> DocumentLoadResult:
+def load_uploaded_documents(uploaded_files, document_languages: list[str] | None = None) -> DocumentLoadResult:
     documents: list[Document] = []
     processed_files: list[str] = []
     warnings: list[str] = []
@@ -40,7 +50,11 @@ def load_uploaded_documents(uploaded_files) -> DocumentLoadResult:
             temp_paths.append(temp_path)
 
             try:
-                loaded_documents = load_file(temp_path, uploaded_file.name)
+                loaded_documents = load_file(
+                    temp_path,
+                    uploaded_file.name,
+                    document_languages=document_languages,
+                )
             except Exception as exc:
                 LOGGER.exception("No se pudo procesar el archivo %s", uploaded_file.name)
                 warnings.append(f"No pude procesar {uploaded_file.name}: {exc}")
@@ -66,17 +80,28 @@ def load_uploaded_documents(uploaded_files) -> DocumentLoadResult:
     )
 
 
-def load_file(file_path: Path, display_name: str | None = None) -> list[Document]:
+def load_file(
+    file_path: Path,
+    display_name: str | None = None,
+    *,
+    document_languages: list[str] | None = None,
+) -> list[Document]:
     suffix = file_path.suffix.lower()
     source_name = display_name or file_path.name
 
     if suffix not in SUPPORTED_EXTENSIONS:
         raise ValueError(f"Formato no soportado: {suffix}")
 
+    if suffix == ".txt":
+        return _load_txt(file_path, source_name)
+
     if suffix == ".xlsx":
         return _load_xlsx(file_path, source_name)
 
-    elements = partition(filename=str(file_path))
+    elements = partition(
+        filename=str(file_path),
+        languages=document_languages,
+    )
     documents: list[Document] = []
 
     for index, element in enumerate(elements, start=1):
@@ -94,6 +119,32 @@ def load_file(file_path: Path, display_name: str | None = None) -> list[Document
             metadata["page_number"] = page_number
 
         documents.append(Document(page_content=text.strip(), metadata=metadata))
+
+    return documents
+
+
+def _load_txt(file_path: Path, source_name: str) -> list[Document]:
+    raw_text = _read_text_file(file_path)
+    sections = _split_txt_sections(raw_text)
+    documents: list[Document] = []
+
+    for index, section in enumerate(sections, start=1):
+        metadata = {
+            "source": source_name,
+            "element_index": index,
+            "file_type": "txt",
+        }
+        if section.title:
+            metadata["section_title"] = section.title
+        if section.command_lines:
+            metadata["command_lines"] = section.command_lines
+
+        documents.append(
+            Document(
+                page_content=section.content,
+                metadata=metadata,
+            )
+        )
 
     return documents
 
@@ -170,6 +221,104 @@ def _normalize_cell(value) -> str:
         return value.isoformat()
     text = str(value).strip()
     return text
+
+
+def _read_text_file(file_path: Path) -> str:
+    file_bytes = file_path.read_bytes()
+    for encoding in TEXT_ENCODINGS:
+        try:
+            return file_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return file_bytes.decode("utf-8", errors="replace")
+
+
+def _split_txt_sections(raw_text: str) -> list[TxtSection]:
+    lines = [
+        _normalize_text_line(line)
+        for line in raw_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    ]
+
+    sections: list[TxtSection] = []
+    pending_context: list[str] = []
+    current_prefix: list[str] = []
+    current_heading: str | None = None
+    current_body: list[str] = []
+
+    for line in lines:
+        if not line:
+            continue
+
+        if _is_txt_heading(line):
+            if current_heading is not None:
+                if current_body:
+                    sections.append(_compose_txt_section(current_prefix, current_heading, current_body))
+                else:
+                    pending_context.extend(current_prefix)
+                    pending_context.append(current_heading)
+                current_prefix = []
+                current_body = []
+
+            current_prefix = pending_context
+            pending_context = []
+            current_heading = line
+            continue
+
+        if current_heading is not None:
+            current_body.append(line)
+        else:
+            pending_context.append(line)
+
+    if current_heading is not None:
+        if current_body:
+            sections.append(_compose_txt_section(current_prefix, current_heading, current_body))
+        else:
+            pending_context.extend(current_prefix)
+            pending_context.append(current_heading)
+
+    if pending_context:
+        sections.insert(
+            0,
+            TxtSection(
+                content="\n".join(pending_context),
+                title=None,
+                command_lines=_extract_command_lines(pending_context),
+            ),
+        )
+
+    return [section for section in sections if section.content.strip()]
+
+
+def _normalize_text_line(line: str) -> str:
+    normalized = line.strip()
+    normalized = normalized.replace("•", "-")
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized
+
+
+def _is_txt_heading(line: str) -> bool:
+    if line.startswith("- "):
+        return False
+    if TXT_HEADING_PATTERN.match(line):
+        return True
+    return line.endswith(":") and len(line) <= 120
+
+
+def _compose_txt_section(prefix: list[str], heading: str, body: list[str]) -> TxtSection:
+    section_lines = [*prefix, heading, *body]
+    return TxtSection(
+        content="\n".join(section_lines),
+        title=heading,
+        command_lines=_extract_command_lines(body),
+    )
+
+
+def _extract_command_lines(lines: list[str]) -> list[str]:
+    return [
+        line
+        for line in lines
+        if re.match(r"^(docker|ollama|\/set)\b", line, re.IGNORECASE)
+    ]
 
 
 def _build_header_names(

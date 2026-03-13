@@ -50,6 +50,15 @@ def _parse_bool(value: str, default: bool) -> bool:
     return normalized in {"1", "true", "yes", "on"}
 
 
+def _parse_csv_list(env_name: str, default: list[str]) -> list[str]:
+    raw_value = os.getenv(env_name, "").strip()
+    if not raw_value:
+        return default
+
+    values = [item.strip() for item in raw_value.split(",") if item.strip()]
+    return values or default
+
+
 @dataclass(slots=True)
 class Settings:
     openrouter_api_key: str
@@ -65,6 +74,7 @@ class Settings:
     require_citations: bool
     temperature: float
     log_level: str
+    document_languages: list[str]
 
 
 def load_settings() -> Settings:
@@ -93,6 +103,7 @@ def load_settings() -> Settings:
         ),
         temperature=_parse_float("TEMPERATURE", 0.0, minimum=0.0, maximum=2.0),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper().strip(),
+        document_languages=_parse_csv_list("DOCUMENT_LANGUAGES", ["spa", "eng"]),
     )
 
     if settings.chunk_overlap >= settings.chunk_size:

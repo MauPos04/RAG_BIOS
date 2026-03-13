@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from functools import lru_cache
 from time import perf_counter
@@ -43,6 +44,46 @@ class StructuredSelection:
     matched_dates: list[str] = field(default_factory=list)
     matched_rows: list[int] = field(default_factory=list)
     exact_answer: str | None = None
+
+
+@dataclass(slots=True)
+class StructuredTextSelection:
+    matches: list[tuple[Document, float]] = field(default_factory=list)
+    exact_answer: str | None = None
+
+
+LEXICAL_STOPWORDS = {
+    "como",
+    "con",
+    "cual",
+    "cuanto",
+    "de",
+    "del",
+    "donde",
+    "el",
+    "ella",
+    "ellas",
+    "ellos",
+    "en",
+    "hay",
+    "las",
+    "los",
+    "nota",
+    "notas",
+    "para",
+    "por",
+    "que",
+    "segun",
+    "solo",
+    "sobre",
+    "una",
+    "uno",
+    "unos",
+    "unas",
+    "usar",
+    "uso",
+    "y",
+}
 
 
 def chunk_documents(documents: list[Document], settings: Settings) -> list[Document]:
@@ -130,15 +171,45 @@ def answer_question(
             )
         return _answer_from_evidence(question, evidence, settings, diagnostics)
 
+    structured_text_selection = _select_structured_txt_matches(
+        question,
+        source_documents or [],
+        settings.top_k,
+    )
+    if structured_text_selection.matches:
+        diagnostics.update(
+            {
+                "retrieval_mode": "structured_txt",
+                "retrieved_pairs": len(structured_text_selection.matches),
+                "selected_pairs": len(structured_text_selection.matches),
+            }
+        )
+        LOGGER.info(
+            "Lookup estructurado TXT | matches=%s",
+            len(structured_text_selection.matches),
+        )
+        evidence = _build_evidence(
+            structured_text_selection.matches,
+            metric_label="coincidencia",
+        )
+        if structured_text_selection.exact_answer:
+            diagnostics["citation_mode"] = "structured_exact"
+            return RetrievalResult(
+                answer=structured_text_selection.exact_answer,
+                evidence=evidence,
+                diagnostics=diagnostics,
+            )
+        return _answer_from_evidence(question, evidence, settings, diagnostics)
+
     retrieval_started_at = perf_counter()
-    retrieval_k = max(settings.top_k, settings.top_k * settings.retrieval_multiplier)
+    retrieval_k = max(settings.top_k, settings.top_k * settings.retrieval_multiplier, 50)
     retrieved_pairs = vector_store.similarity_search_with_score(
         question,
         k=retrieval_k,
     )
     retrieval_elapsed_ms = round((perf_counter() - retrieval_started_at) * 1000, 2)
 
-    ranked_pairs = sorted(retrieved_pairs, key=lambda item: item[1])
+    ranked_pairs = _rank_retrieved_pairs(question, retrieved_pairs)
     selected_pairs = ranked_pairs[: settings.top_k]
 
     diagnostics.update(
@@ -148,6 +219,10 @@ def answer_question(
             "selected_pairs": len(selected_pairs),
             "retrieval_metric": "distance",
             "retrieval_distances": [round(float(score), 3) for _, score in ranked_pairs],
+            "lexical_overlaps": [
+                _lexical_overlap(question, document.page_content)
+                for document, _ in ranked_pairs
+            ],
             "retrieval_ms": retrieval_elapsed_ms,
         }
     )
@@ -316,6 +391,48 @@ def _select_structured_xlsx_matches(
     )
 
 
+def _select_structured_txt_matches(
+    question: str,
+    source_documents: list[Document],
+    top_k: int,
+) -> StructuredTextSelection:
+    query_terms = _extract_query_terms(question)
+    if not query_terms:
+        return StructuredTextSelection()
+
+    txt_documents = [
+        document
+        for document in source_documents
+        if document.metadata.get("file_type") == "txt"
+        and document.metadata.get("section_title")
+    ]
+    if not txt_documents:
+        return StructuredTextSelection()
+
+    scored_matches: list[tuple[Document, float]] = []
+    for document in txt_documents:
+        title = str(document.metadata.get("section_title", ""))
+        title_overlap = _lexical_overlap_with_terms(query_terms, title)
+        if title_overlap <= 0:
+            continue
+        scored_matches.append((document, float(title_overlap)))
+
+    if not scored_matches:
+        return StructuredTextSelection()
+
+    scored_matches.sort(key=lambda item: (-item[1], item[0].metadata.get("element_index", 0)))
+    selected_matches = scored_matches[: min(top_k, 3)]
+
+    exact_answer = None
+    if _is_exact_txt_lookup(question):
+        exact_answer = _build_exact_txt_answer(selected_matches)
+
+    return StructuredTextSelection(
+        matches=selected_matches,
+        exact_answer=exact_answer,
+    )
+
+
 def _collect_xlsx_columns(documents: list[Document]) -> list[str]:
     for document in documents:
         column_names = document.metadata.get("column_names")
@@ -407,6 +524,116 @@ def _build_exact_xlsx_row_answer(document: Document) -> str:
     )
     values = "; ".join(f"{column} = {value}" for column, value in row_data.items())
     return f"Para {row_label}: {values} [E1]."
+
+
+def _rank_retrieved_pairs(
+    question: str,
+    retrieved_pairs: list[tuple[Document, float]],
+) -> list[tuple[Document, float]]:
+    query_terms = _extract_query_terms(question)
+    if not query_terms:
+        return sorted(retrieved_pairs, key=lambda item: item[1])
+
+    ranked_items = [
+        (
+            document,
+            score,
+            _lexical_overlap_with_terms(query_terms, document.page_content),
+        )
+        for document, score in retrieved_pairs
+    ]
+    ranked_items.sort(key=lambda item: (-item[2], item[1]))
+    return [(document, score) for document, score, _ in ranked_items]
+
+
+def _lexical_overlap(question: str, content: str) -> int:
+    return _lexical_overlap_with_terms(_extract_query_terms(question), content)
+
+
+def _lexical_overlap_with_terms(query_terms: set[str], content: str) -> int:
+    if not query_terms:
+        return 0
+
+    content_terms = _extract_query_terms(content)
+    overlap = 0
+    for query_term in query_terms:
+        if any(_terms_match(query_term, content_term) for content_term in content_terms):
+            overlap += 1
+    return overlap
+
+
+def _extract_query_terms(value: str) -> set[str]:
+    normalized = _normalize_free_text(value)
+    return {
+        term
+        for term in re.findall(r"[a-z0-9]+", normalized)
+        if len(term) >= 4 and term not in LEXICAL_STOPWORDS
+    }
+
+
+def _normalize_free_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value.lower())
+    return normalized.encode("ascii", "ignore").decode("ascii")
+
+
+def _terms_match(query_term: str, content_term: str) -> bool:
+    if query_term == content_term:
+        return True
+    minimum_prefix = min(len(query_term), len(content_term), 4)
+    if minimum_prefix < 4:
+        return False
+    return query_term[:minimum_prefix] == content_term[:minimum_prefix]
+
+
+def _is_exact_txt_lookup(question: str) -> bool:
+    question_lower = _normalize_free_text(question)
+    trigger_terms = (
+        "como",
+        "comando",
+        "pasos",
+        "que dicen",
+        "que dice",
+        "levanto",
+        "mira",
+        "modelos disponibles",
+    )
+    return any(term in question_lower for term in trigger_terms)
+
+
+def _build_exact_txt_answer(selected_matches: list[tuple[Document, float]]) -> str | None:
+    answer_parts: list[str] = []
+
+    for index, (document, _) in enumerate(selected_matches, start=1):
+        commands = document.metadata.get("command_lines", [])
+        if not isinstance(commands, list) or not commands:
+            continue
+
+        title = _clean_txt_section_title(str(document.metadata.get("section_title", "")))
+        if not title:
+            continue
+
+        action = _describe_txt_section(title)
+        answer_parts.append(f"Para {action} usa: `{commands[0]}` [E{index}].")
+
+    if not answer_parts:
+        return None
+    return " ".join(answer_parts)
+
+
+def _clean_txt_section_title(title: str) -> str:
+    cleaned = re.sub(r"^\d+[.)]\s*", "", title).strip()
+    return cleaned.rstrip(":").strip()
+
+
+def _describe_txt_section(title: str) -> str:
+    normalized_title = _normalize_free_text(title)
+    if normalized_title.startswith("levanta ollama"):
+        return "levantar Ollama"
+    if normalized_title.startswith("mira modelos disponibles"):
+        return "ver los modelos disponibles"
+    if normalized_title.startswith("chatea en terminal con uno"):
+        return "chatear en terminal con un modelo"
+    return title[0].lower() + title[1:] if title else "esa accion"
 
 
 def _build_evidence(

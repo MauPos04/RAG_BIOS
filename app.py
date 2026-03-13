@@ -170,7 +170,10 @@ def _process_documents(uploaded_files, settings) -> None:
     try:
         with st.spinner("Extrayendo texto y creando indice vectorial..."):
             extraction_started_at = perf_counter()
-            load_result = load_uploaded_documents(uploaded_files)
+            load_result = load_uploaded_documents(
+                uploaded_files,
+                document_languages=settings.document_languages,
+            )
             extraction_elapsed_ms = round((perf_counter() - extraction_started_at) * 1000, 2)
 
             if not load_result.documents:
