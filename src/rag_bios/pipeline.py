@@ -18,7 +18,7 @@ from langchain_openai import ChatOpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from .config import Settings
-from .prompts import GROUNDING_PROMPT
+from .prompts import CLARIFICATION_PROMPT, GROUNDING_PROMPT
 
 
 LOGGER = logging.getLogger(__name__)
@@ -26,7 +26,73 @@ ABSTENTION_ANSWER = "No encontre esa informacion en los documentos cargados."
 CITATION_PATTERN = re.compile(r"\[(E\d+)\]")
 DATE_PATTERN = re.compile(r"\b(\d{4}[-/]\d{2}[-/]\d{2})\b")
 ROW_PATTERN = re.compile(r"\bfila\s+(\d+)\b", re.IGNORECASE)
+FOLLOW_UP_PREFIXES = (
+    "y ",
+    "e ",
+    "tambien",
+    "también",
+    "entonces",
+    "ahora",
+    "eso",
+    "esa",
+    "ese",
+    "esto",
+    "el otro",
+    "la otra",
+    "del otro",
+    "de la otra",
+)
+GENERIC_COLUMN_TOKENS = {"close", "open", "high", "low", "adj", "volume", "price"}
 VALUE_LOOKUP_TERMS = ("cual", "cuál", "valor", "dato", "dime", "muestra", "muéstrame")
+TXT_COMMAND_HINTS = (
+    "comando",
+    "levanto",
+    "levantar",
+    "arranco",
+    "arrancar",
+    "inicio",
+    "iniciar",
+    "ejecuto",
+    "ejecutar",
+    "corro",
+    "correr",
+    "pasos",
+    "mira",
+    "modelos disponibles",
+)
+TXT_PURPOSE_HINTS = (
+    "como funciona",
+    "que hace",
+    "de que sirve",
+    "para que sirve",
+    "para que funciona",
+    "para que",
+    "que significa",
+)
+TXT_SUMMARY_HINTS = (
+    "que dicen",
+    "que dice",
+    "explica",
+    "resume",
+    "resumen",
+    "de que trata",
+)
+TABULAR_HINTS = (
+    "fila",
+    "fila ",
+    "hoja",
+    "columna",
+    "column",
+    "valor",
+    "dato",
+    "fecha",
+    "date",
+    "close",
+    "open",
+    "high",
+    "low",
+    "volume",
+)
 
 
 @dataclass(slots=True)
@@ -34,6 +100,7 @@ class RetrievalResult:
     answer: str
     evidence: list[dict]
     warnings: list[str] = field(default_factory=list)
+    suggestions: list[str] = field(default_factory=list)
     diagnostics: dict = field(default_factory=dict)
 
 
@@ -50,6 +117,7 @@ class StructuredSelection:
 class StructuredTextSelection:
     matches: list[tuple[Document, float]] = field(default_factory=list)
     exact_answer: str | None = None
+    intent: str = "semantic"
 
 
 LEXICAL_STOPWORDS = {
@@ -123,22 +191,49 @@ def build_vector_store(documents: list[Document], settings: Settings) -> FAISS:
     )
 
 
+def load_vector_store(folder_path: str | os.PathLike[str], settings: Settings) -> FAISS:
+    embeddings = _get_embeddings(settings.embedding_model)
+    return FAISS.load_local(
+        str(folder_path),
+        embeddings,
+        allow_dangerous_deserialization=True,
+    )
+
+
+def _build_llm(settings: Settings) -> ChatOpenAI:
+    return ChatOpenAI(
+        model=settings.openrouter_model,
+        temperature=settings.temperature,
+        api_key=settings.openrouter_api_key,
+        base_url=settings.openrouter_base_url,
+        default_headers={
+            "HTTP-Referer": settings.openrouter_http_referer,
+            "X-Title": settings.openrouter_x_title,
+        },
+    )
+
+
 def answer_question(
     vector_store: FAISS,
     question: str,
     settings: Settings,
     source_documents: list[Document] | None = None,
+    *,
+    chat_history: list[dict] | None = None,
 ) -> RetrievalResult:
+    recent_chat_history = chat_history or []
     diagnostics = {
         "model": settings.openrouter_model,
         "retrieval_mode": "semantic",
         "llm_called": False,
+        "chat_memory_turns": len(recent_chat_history) // 2,
     }
 
     structured_selection = _select_structured_xlsx_matches(
         question,
         source_documents or [],
         settings.top_k,
+        recent_chat_history,
     )
     if structured_selection.matches:
         diagnostics.update(
@@ -169,12 +264,19 @@ def answer_question(
                 evidence=evidence,
                 diagnostics=diagnostics,
             )
-        return _answer_from_evidence(question, evidence, settings, diagnostics)
+        return _answer_from_evidence(
+            question,
+            evidence,
+            settings,
+            diagnostics,
+            recent_chat_history,
+        )
 
     structured_text_selection = _select_structured_txt_matches(
         question,
         source_documents or [],
         settings.top_k,
+        recent_chat_history,
     )
     if structured_text_selection.matches:
         diagnostics.update(
@@ -182,10 +284,12 @@ def answer_question(
                 "retrieval_mode": "structured_txt",
                 "retrieved_pairs": len(structured_text_selection.matches),
                 "selected_pairs": len(structured_text_selection.matches),
+                "txt_intent": structured_text_selection.intent,
             }
         )
         LOGGER.info(
-            "Lookup estructurado TXT | matches=%s",
+            "Lookup estructurado TXT | intent=%s | matches=%s",
+            structured_text_selection.intent,
             len(structured_text_selection.matches),
         )
         evidence = _build_evidence(
@@ -199,28 +303,37 @@ def answer_question(
                 evidence=evidence,
                 diagnostics=diagnostics,
             )
-        return _answer_from_evidence(question, evidence, settings, diagnostics)
+        return _answer_from_evidence(
+            question,
+            evidence,
+            settings,
+            diagnostics,
+            recent_chat_history,
+        )
 
+    retrieval_question = _build_retrieval_question(question, recent_chat_history)
     retrieval_started_at = perf_counter()
     retrieval_k = max(settings.top_k, settings.top_k * settings.retrieval_multiplier, 50)
     retrieved_pairs = vector_store.similarity_search_with_score(
-        question,
+        retrieval_question,
         k=retrieval_k,
     )
     retrieval_elapsed_ms = round((perf_counter() - retrieval_started_at) * 1000, 2)
 
-    ranked_pairs = _rank_retrieved_pairs(question, retrieved_pairs)
+    ranked_pairs = _rank_retrieved_pairs(retrieval_question, retrieved_pairs)
     selected_pairs = ranked_pairs[: settings.top_k]
 
     diagnostics.update(
         {
+            "memory_used_for_retrieval": retrieval_question != question,
             "retrieval_k": retrieval_k,
+            "retrieval_query": retrieval_question,
             "retrieved_pairs": len(retrieved_pairs),
             "selected_pairs": len(selected_pairs),
             "retrieval_metric": "distance",
             "retrieval_distances": [round(float(score), 3) for _, score in ranked_pairs],
             "lexical_overlaps": [
-                _lexical_overlap(question, document.page_content)
+                _lexical_overlap(retrieval_question, document.page_content)
                 for document, _ in ranked_pairs
             ],
             "retrieval_ms": retrieval_elapsed_ms,
@@ -245,7 +358,13 @@ def answer_question(
         )
 
     evidence = _build_evidence(selected_pairs, metric_label="distancia")
-    return _answer_from_evidence(question, evidence, settings, diagnostics)
+    return _answer_from_evidence(
+        question,
+        evidence,
+        settings,
+        diagnostics,
+        recent_chat_history,
+    )
 
 
 def _answer_from_evidence(
@@ -253,19 +372,12 @@ def _answer_from_evidence(
     evidence: list[dict],
     settings: Settings,
     diagnostics: dict,
+    chat_history: list[dict],
 ) -> RetrievalResult:
     context = _build_context(evidence)
+    formatted_chat_history = _format_chat_history(chat_history)
     prompt = ChatPromptTemplate.from_template(GROUNDING_PROMPT)
-    llm = ChatOpenAI(
-        model=settings.openrouter_model,
-        temperature=settings.temperature,
-        api_key=settings.openrouter_api_key,
-        base_url=settings.openrouter_base_url,
-        default_headers={
-            "HTTP-Referer": settings.openrouter_http_referer,
-            "X-Title": settings.openrouter_x_title,
-        },
-    )
+    llm = _build_llm(settings)
     chain = prompt | llm | StrOutputParser()
 
     LOGGER.info(
@@ -275,7 +387,13 @@ def _answer_from_evidence(
     )
     llm_started_at = perf_counter()
     try:
-        answer = chain.invoke({"context": context, "question": question})
+        answer = chain.invoke(
+            {
+                "context": context,
+                "question": question,
+                "chat_history": formatted_chat_history,
+            }
+        )
     except Exception as exc:
         LOGGER.exception("Fallo la llamada al modelo %s", settings.openrouter_model)
         raise RuntimeError(
@@ -292,7 +410,6 @@ def _answer_from_evidence(
         settings,
     )
     diagnostics["citation_mode"] = citation_mode
-    diagnostics["cited_ids"] = cited_ids
 
     LOGGER.info(
         "Respuesta validada | citation_mode=%s | cited_ids=%s | warnings=%s",
@@ -302,16 +419,29 @@ def _answer_from_evidence(
     )
 
     if validated_answer == ABSTENTION_ANSWER:
+        suggestions = _suggest_clarifying_questions(
+            question,
+            evidence,
+            settings,
+            chat_history,
+        )
+        diagnostics["suggestions_count"] = len(suggestions)
         return RetrievalResult(
             answer=validated_answer,
             evidence=evidence,
             warnings=warnings,
+            suggestions=suggestions,
             diagnostics=diagnostics,
         )
 
-    cited_evidence = [item for item in evidence if item["id"] in cited_ids] or evidence
+    normalized_answer, cited_evidence, normalized_cited_ids = _normalize_cited_output(
+        validated_answer,
+        evidence,
+        cited_ids,
+    )
+    diagnostics["cited_ids"] = normalized_cited_ids
     return RetrievalResult(
-        answer=validated_answer,
+        answer=normalized_answer,
         evidence=cited_evidence,
         warnings=warnings,
         diagnostics=diagnostics,
@@ -322,6 +452,7 @@ def _select_structured_xlsx_matches(
     question: str,
     source_documents: list[Document],
     top_k: int,
+    chat_history: list[dict],
 ) -> StructuredSelection:
     xlsx_documents = [
         document
@@ -332,13 +463,23 @@ def _select_structured_xlsx_matches(
     if not xlsx_documents:
         return StructuredSelection()
 
-    query_dates = _extract_query_dates(question)
-    query_rows = _extract_query_rows(question)
+    available_columns = _collect_xlsx_columns(xlsx_documents)
+    lookup_question = _enrich_structured_xlsx_question(question, chat_history, available_columns)
+    query_dates = _extract_query_dates(lookup_question)
+    query_rows = _extract_query_rows(lookup_question)
     if not query_dates and not query_rows:
         return StructuredSelection()
 
-    available_columns = _collect_xlsx_columns(xlsx_documents)
-    matched_columns = _extract_query_columns(question, available_columns)
+    matched_columns = _extract_query_columns(lookup_question, available_columns)
+    if not _should_use_structured_xlsx(
+        question,
+        lookup_question,
+        query_dates,
+        query_rows,
+        matched_columns,
+        bool(chat_history),
+    ):
+        return StructuredSelection()
 
     scored_matches: list[tuple[Document, float]] = []
     for document in xlsx_documents:
@@ -377,9 +518,13 @@ def _select_structured_xlsx_matches(
     exact_answer = None
     if len(scored_matches) == 1:
         matched_document = scored_matches[0][0]
-        if matched_columns and _is_exact_value_lookup(question):
+        if matched_columns and (
+            _is_exact_value_lookup(lookup_question) or _is_follow_up_question(question)
+        ):
             exact_answer = _build_exact_xlsx_answer(matched_document, matched_columns)
-        elif not matched_columns and _is_exact_row_lookup(question):
+        elif not matched_columns and (
+            _is_exact_row_lookup(lookup_question) or _is_follow_up_question(question)
+        ):
             exact_answer = _build_exact_xlsx_row_answer(matched_document)
 
     return StructuredSelection(
@@ -395,10 +540,13 @@ def _select_structured_txt_matches(
     question: str,
     source_documents: list[Document],
     top_k: int,
+    chat_history: list[dict],
 ) -> StructuredTextSelection:
-    query_terms = _extract_query_terms(question)
+    lookup_question = _build_retrieval_question(question, chat_history)
+    query_terms = _extract_query_terms(lookup_question)
     if not query_terms:
         return StructuredTextSelection()
+    txt_intent = _classify_txt_intent(question, chat_history)
 
     txt_documents = [
         document
@@ -413,23 +561,29 @@ def _select_structured_txt_matches(
     for document in txt_documents:
         title = str(document.metadata.get("section_title", ""))
         title_overlap = _lexical_overlap_with_terms(query_terms, title)
+        body_overlap = _lexical_overlap_with_terms(query_terms, document.page_content)
         if title_overlap <= 0:
             continue
-        scored_matches.append((document, float(title_overlap)))
+        scored_matches.append((document, float(title_overlap * 3 + body_overlap)))
 
     if not scored_matches:
-        return StructuredTextSelection()
+        return StructuredTextSelection(intent=txt_intent)
 
     scored_matches.sort(key=lambda item: (-item[1], item[0].metadata.get("element_index", 0)))
-    selected_matches = scored_matches[: min(top_k, 3)]
+    selected_matches = _expand_txt_neighbor_matches(
+        scored_matches,
+        txt_documents,
+        min(top_k, 4),
+    )
 
     exact_answer = None
-    if _is_exact_txt_lookup(question):
+    if txt_intent == "command" and _is_exact_txt_lookup(lookup_question):
         exact_answer = _build_exact_txt_answer(selected_matches)
 
     return StructuredTextSelection(
         matches=selected_matches,
         exact_answer=exact_answer,
+        intent=txt_intent,
     )
 
 
@@ -444,6 +598,7 @@ def _collect_xlsx_columns(documents: list[Document]) -> list[str]:
 def _extract_query_columns(question: str, available_columns: list[str]) -> list[str]:
     question_lower = question.lower()
     question_compact = _normalize_lookup_token(question)
+    question_terms = _extract_query_terms(question)
     matched_columns: list[str] = []
 
     for column in available_columns:
@@ -454,6 +609,15 @@ def _extract_query_columns(question: str, available_columns: list[str]) -> list[
             matched_columns.append(column)
             continue
         if column_spaced and column_spaced in question_lower:
+            matched_columns.append(column)
+            continue
+
+        column_terms = [
+            token
+            for token in re.findall(r"[a-z0-9]+", _normalize_free_text(column_spaced))
+            if len(token) >= 4 and token not in GENERIC_COLUMN_TOKENS
+        ]
+        if any(term in question_terms for term in column_terms):
             matched_columns.append(column)
 
     return matched_columns
@@ -526,6 +690,26 @@ def _build_exact_xlsx_row_answer(document: Document) -> str:
     return f"Para {row_label}: {values} [E1]."
 
 
+def _should_use_structured_xlsx(
+    question: str,
+    lookup_question: str,
+    query_dates: set[str],
+    query_rows: set[int],
+    matched_columns: list[str],
+    has_chat_history: bool,
+) -> bool:
+    if query_rows or matched_columns:
+        return True
+    if not query_dates:
+        return False
+    if _is_exact_row_lookup(lookup_question):
+        return True
+    if has_chat_history and _is_follow_up_question(question):
+        return True
+    normalized_lookup = _normalize_free_text(lookup_question)
+    return any(term in normalized_lookup for term in TABULAR_HINTS)
+
+
 def _rank_retrieved_pairs(
     question: str,
     retrieved_pairs: list[tuple[Document, float]],
@@ -576,33 +760,174 @@ def _normalize_free_text(value: str) -> str:
     return normalized.encode("ascii", "ignore").decode("ascii")
 
 
+def _build_retrieval_question(question: str, chat_history: list[dict]) -> str:
+    if not chat_history or not _is_follow_up_question(question):
+        return question
+
+    last_user_question = _last_user_question(chat_history)
+    last_assistant_answer = _last_assistant_answer(chat_history)
+    if not last_user_question and not last_assistant_answer:
+        return question
+
+    retrieval_parts = [question]
+    if last_user_question:
+        retrieval_parts.append(f"Pregunta previa: {last_user_question}")
+    if last_assistant_answer:
+        cleaned_answer = CITATION_PATTERN.sub("", last_assistant_answer).strip()
+        if cleaned_answer:
+            retrieval_parts.append(f"Respuesta previa: {cleaned_answer}")
+    return "\n".join(retrieval_parts)
+
+
+def _enrich_structured_xlsx_question(
+    question: str,
+    chat_history: list[dict],
+    available_columns: list[str],
+) -> str:
+    if not chat_history:
+        return question
+
+    current_dates = _extract_query_dates(question)
+    current_rows = _extract_query_rows(question)
+    current_columns = _extract_query_columns(question, available_columns)
+
+    if current_dates and (current_rows or current_columns):
+        return question
+
+    inherited_dates: set[str] = set()
+    inherited_rows: set[int] = set()
+    inherited_columns: list[str] = []
+
+    for previous_question in _recent_user_questions(chat_history):
+        if not current_dates:
+            inherited_dates = _extract_query_dates(previous_question)
+        if not current_rows:
+            inherited_rows = _extract_query_rows(previous_question)
+        if not current_columns:
+            inherited_columns = _extract_query_columns(previous_question, available_columns)
+
+        if inherited_dates or inherited_rows or inherited_columns:
+            break
+
+    if not inherited_dates and not inherited_rows and not inherited_columns:
+        return question
+
+    hint_parts = [question]
+    if not current_dates:
+        hint_parts.extend(f"fecha {value}" for value in sorted(inherited_dates))
+    if not current_rows:
+        hint_parts.extend(f"fila {value}" for value in sorted(inherited_rows))
+    if not current_columns:
+        hint_parts.extend(f"columna {value}" for value in inherited_columns)
+    return " ".join(hint_parts)
+
+
+def _is_follow_up_question(question: str) -> bool:
+    normalized_question = _normalize_free_text(question).strip()
+    if not normalized_question:
+        return False
+
+    if any(normalized_question.startswith(prefix) for prefix in FOLLOW_UP_PREFIXES):
+        return True
+
+    return len(_extract_query_terms(question)) <= 2
+
+
+def _recent_user_questions(chat_history: list[dict]) -> list[str]:
+    return [
+        str(message.get("content", "")).strip()
+        for message in reversed(chat_history)
+        if message.get("role") == "user" and str(message.get("content", "")).strip()
+    ]
+
+
+def _last_user_question(chat_history: list[dict]) -> str:
+    recent_questions = _recent_user_questions(chat_history)
+    return recent_questions[0] if recent_questions else ""
+
+
+def _last_assistant_answer(chat_history: list[dict]) -> str:
+    for message in reversed(chat_history):
+        if message.get("role") != "assistant":
+            continue
+        content = str(message.get("content", "")).strip()
+        if content:
+            return content
+    return ""
+
+
+def _format_chat_history(chat_history: list[dict]) -> str:
+    if not chat_history:
+        return "Sin historial reciente."
+
+    formatted_messages = []
+    for message in chat_history:
+        role = "Usuario" if message.get("role") == "user" else "Asistente"
+        content = _truncate_text(str(message.get("content", "")).strip(), 240)
+        if content:
+            formatted_messages.append(f"{role}: {content}")
+    return "\n".join(formatted_messages) or "Sin historial reciente."
+
+
+def _truncate_text(value: str, max_length: int) -> str:
+    if len(value) <= max_length:
+        return value
+    return f"{value[: max_length - 3].rstrip()}..."
+
+
 def _terms_match(query_term: str, content_term: str) -> bool:
     if query_term == content_term:
         return True
-    minimum_prefix = min(len(query_term), len(content_term), 4)
-    if minimum_prefix < 4:
+    shorter_term, longer_term = sorted((query_term, content_term), key=len)
+    if len(shorter_term) < 5:
         return False
-    return query_term[:minimum_prefix] == content_term[:minimum_prefix]
+    if not longer_term.startswith(shorter_term):
+        return False
+    return len(longer_term) - len(shorter_term) <= 2
 
 
 def _is_exact_txt_lookup(question: str) -> bool:
     question_lower = _normalize_free_text(question)
     trigger_terms = (
-        "como",
         "comando",
         "pasos",
         "que dicen",
         "que dice",
         "levanto",
+        "levantar",
+        "arranco",
+        "arrancar",
+        "inicio",
+        "iniciar",
+        "ejecuto",
+        "ejecutar",
         "mira",
         "modelos disponibles",
     )
     return any(term in question_lower for term in trigger_terms)
 
 
-def _build_exact_txt_answer(selected_matches: list[tuple[Document, float]]) -> str | None:
-    answer_parts: list[str] = []
+def _classify_txt_intent(question: str, chat_history: list[dict]) -> str:
+    normalized_question = _normalize_free_text(question)
+    if any(term in normalized_question for term in TXT_PURPOSE_HINTS):
+        return "purpose"
+    if any(term in normalized_question for term in TXT_COMMAND_HINTS):
+        return "command"
+    if any(term in normalized_question for term in TXT_SUMMARY_HINTS):
+        return "summary"
 
+    retrieval_question = _build_retrieval_question(question, chat_history)
+    normalized_retrieval = _normalize_free_text(retrieval_question)
+    if any(term in normalized_retrieval for term in TXT_PURPOSE_HINTS):
+        return "purpose"
+    if any(term in normalized_retrieval for term in TXT_COMMAND_HINTS):
+        return "command"
+    if any(term in normalized_retrieval for term in TXT_SUMMARY_HINTS):
+        return "summary"
+    return "reference"
+
+
+def _build_exact_txt_answer(selected_matches: list[tuple[Document, float]]) -> str | None:
     for index, (document, _) in enumerate(selected_matches, start=1):
         commands = document.metadata.get("command_lines", [])
         if not isinstance(commands, list) or not commands:
@@ -613,11 +938,56 @@ def _build_exact_txt_answer(selected_matches: list[tuple[Document, float]]) -> s
             continue
 
         action = _describe_txt_section(title)
-        answer_parts.append(f"Para {action} usa: `{commands[0]}` [E{index}].")
+        return f"Para {action} usa: `{commands[0]}` [E{index}]."
 
-    if not answer_parts:
-        return None
-    return " ".join(answer_parts)
+    return None
+
+
+def _expand_txt_neighbor_matches(
+    scored_matches: list[tuple[Document, float]],
+    txt_documents: list[Document],
+    limit: int,
+) -> list[tuple[Document, float]]:
+    if not scored_matches:
+        return []
+
+    documents_by_key = {
+        (document.metadata.get("source"), document.metadata.get("element_index")): document
+        for document in txt_documents
+    }
+    expanded_matches: list[tuple[Document, float]] = []
+    seen_keys: set[tuple[str | None, int | None]] = set()
+
+    for document, score in scored_matches:
+        current_key = (document.metadata.get("source"), document.metadata.get("element_index"))
+        if current_key not in seen_keys:
+            expanded_matches.append((document, score))
+            seen_keys.add(current_key)
+
+        element_index = document.metadata.get("element_index")
+        if not isinstance(element_index, int):
+            continue
+
+        for offset, penalty in ((-1, 0.35), (1, 0.25)):
+            neighbor_key = (document.metadata.get("source"), element_index + offset)
+            if neighbor_key in seen_keys:
+                continue
+            neighbor = documents_by_key.get(neighbor_key)
+            if neighbor is None:
+                continue
+            expanded_matches.append((neighbor, max(score - penalty, 0.1)))
+            seen_keys.add(neighbor_key)
+
+        if len(expanded_matches) >= limit:
+            break
+
+    expanded_matches.sort(
+        key=lambda item: (
+            -item[1],
+            item[0].metadata.get("element_index", 0),
+        )
+    )
+    return expanded_matches[:limit]
 
 
 def _clean_txt_section_title(title: str) -> str:
@@ -719,6 +1089,80 @@ def _unique_valid_ids(cited_ids: list[str], valid_ids: set[str]) -> list[str]:
         if cited_id in valid_ids and cited_id not in unique_ids:
             unique_ids.append(cited_id)
     return unique_ids
+
+
+def _normalize_cited_output(
+    answer: str,
+    evidence: list[dict],
+    cited_ids: list[str],
+) -> tuple[str, list[dict], list[str]]:
+    if not cited_ids:
+        return answer, evidence, []
+
+    evidence_by_id = {item["id"]: item for item in evidence}
+    cited_evidence = [evidence_by_id[cited_id] for cited_id in cited_ids if cited_id in evidence_by_id]
+    if not cited_evidence:
+        return answer, evidence, []
+
+    remap = {old_id: f"E{index}" for index, old_id in enumerate(cited_ids, start=1)}
+    remapped_answer = CITATION_PATTERN.sub(
+        lambda match: f"[{remap.get(match.group(1), match.group(1))}]",
+        answer,
+    )
+
+    remapped_evidence: list[dict] = []
+    for old_id in cited_ids:
+        item = evidence_by_id.get(old_id)
+        if item is None:
+            continue
+        remapped_item = dict(item)
+        remapped_item["id"] = remap[old_id]
+        remapped_evidence.append(remapped_item)
+
+    return remapped_answer, remapped_evidence, list(remap.values())
+
+
+def _suggest_clarifying_questions(
+    question: str,
+    evidence: list[dict],
+    settings: Settings,
+    chat_history: list[dict],
+) -> list[str]:
+    if not evidence:
+        return []
+
+    prompt = ChatPromptTemplate.from_template(CLARIFICATION_PROMPT)
+    llm = _build_llm(settings)
+    chain = prompt | llm | StrOutputParser()
+
+    try:
+        raw_suggestions = chain.invoke(
+            {
+                "context": _build_context(evidence),
+                "question": question,
+                "chat_history": _format_chat_history(chat_history),
+            }
+        ).strip()
+    except Exception:
+        LOGGER.exception("No pude generar sugerencias de reformulacion.")
+        return []
+
+    if not raw_suggestions or raw_suggestions == "SIN_SUGERENCIAS":
+        return []
+
+    suggestions: list[str] = []
+    for line in raw_suggestions.splitlines():
+        cleaned = line.strip()
+        cleaned = re.sub(r"^[-*]\s*", "", cleaned)
+        cleaned = re.sub(r"^\d+[.)]\s*", "", cleaned)
+        cleaned = cleaned.strip()
+        if not cleaned or cleaned in suggestions:
+            continue
+        suggestions.append(cleaned)
+        if len(suggestions) == 3:
+            break
+
+    return suggestions
 
 
 def _normalize_answer_spacing(answer: str) -> str:
