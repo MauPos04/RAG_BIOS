@@ -245,12 +245,7 @@ def _hash_uploaded_files(uploaded_files) -> str:
 
 
 def _render_evidence(evidence: dict) -> None:
-    metric_value = evidence.get("metric_value")
-    metric_label = evidence.get("metric_label", "score")
-    title = (
-        f"[{evidence['id']}] Fuente: {evidence['source']} | "
-        f"{evidence['location']} | {metric_label} {metric_value}"
-    )
+    title = f"[{evidence['id']}] Fuente: {evidence['source']} | {evidence['location']}"
     with st.expander(title):
         st.write(evidence["content"])
 
