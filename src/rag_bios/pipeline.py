@@ -3,6 +3,7 @@ import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
+from datetime import date
 from functools import lru_cache
 from time import perf_counter
 
@@ -24,7 +25,9 @@ from .prompts import CLARIFICATION_PROMPT, GROUNDING_PROMPT
 LOGGER = logging.getLogger(__name__)
 ABSTENTION_ANSWER = "No encontre esa informacion en los documentos cargados."
 CITATION_PATTERN = re.compile(r"\[(E\d+)\]")
-DATE_PATTERN = re.compile(r"\b(\d{4}[-/]\d{2}[-/]\d{2})\b")
+DATE_PATTERN = re.compile(
+    r"\b((?:\d{4}[-/]\d{1,2}[-/]\d{1,2})|(?:\d{1,2}[-/]\d{1,2}[-/]\d{4}))\b"
+)
 ROW_PATTERN = re.compile(r"\bfila\s+(\d+)\b", re.IGNORECASE)
 FOLLOW_UP_PREFIXES = (
     "y ",
@@ -41,6 +44,15 @@ FOLLOW_UP_PREFIXES = (
     "la otra",
     "del otro",
     "de la otra",
+)
+COUNT_FOLLOW_UP_HINTS = (
+    "cuantas son",
+    "cuantos son",
+    "cuantas hay",
+    "cuantos hay",
+    "cuantas",
+    "cuantos",
+    "numero de",
 )
 GENERIC_COLUMN_TOKENS = {"close", "open", "high", "low", "adj", "volume", "price"}
 VALUE_LOOKUP_TERMS = ("cual", "cuál", "valor", "dato", "dime", "muestra", "muéstrame")
@@ -98,6 +110,7 @@ ENUMERATION_HINTS = (
     "alternativas",
     "situaciones",
     "posibilidades",
+    "finalidades",
     "cuales son",
     "tipos",
     "derechos",
@@ -120,18 +133,24 @@ GENERIC_ENUMERATION_TERMS = {
     "tengo",
 }
 ENUMERATION_EXCLUDE_PREFIXES = (
+    "adicional a las anteriores",
     "formato ",
     "en cumplimiento",
     "si usted",
     "con el envio",
     "el comite",
+    "companias de grupo bios",
+    "el codigo de integridad",
     "firma",
     "indique",
+    "mecanismos para el conocimiento",
     "numero de documento",
     "nombre",
+    "para el ejercicio de mis derechos",
     "correo electronico",
     "ciudad",
     "fecha",
+    "manifiesto que la presente autorizacion",
 )
 
 
@@ -269,6 +288,10 @@ def answer_question(
         "chat_memory_turns": len(recent_chat_history) // 2,
     }
 
+    count_follow_up_result = _answer_count_follow_up(question, recent_chat_history, diagnostics)
+    if count_follow_up_result is not None:
+        return count_follow_up_result
+
     structured_selection = _select_structured_xlsx_matches(
         question,
         source_documents or [],
@@ -397,7 +420,13 @@ def answer_question(
             diagnostics=diagnostics,
         )
 
-    evidence = _build_evidence(selected_pairs, metric_label="distancia")
+    expanded_pairs = _expand_semantic_neighbor_pairs(
+        question,
+        selected_pairs,
+        source_documents or [],
+        limit=max(settings.top_k * 2, 12),
+    )
+    evidence = _build_evidence(expanded_pairs, metric_label="distancia")
     enumeration_answer, enumeration_evidence = _try_build_enumeration_answer(question, evidence)
     if enumeration_answer:
         diagnostics["citation_mode"] = "enumeration_exact"
@@ -413,6 +442,48 @@ def answer_question(
         settings,
         diagnostics,
         recent_chat_history,
+    )
+
+
+def _answer_count_follow_up(
+    question: str,
+    chat_history: list[dict],
+    diagnostics: dict,
+) -> RetrievalResult | None:
+    if not chat_history or not _is_count_follow_up(question):
+        return None
+
+    previous_user_question = _last_user_question(chat_history)
+    previous_assistant_answer = _last_assistant_answer(chat_history)
+    if not previous_user_question or not previous_assistant_answer:
+        return None
+    if not (
+        _is_enumeration_question(previous_user_question)
+        or _normalize_free_text(previous_assistant_answer).startswith(
+            "en el documento se mencionan estas opciones"
+        )
+    ):
+        return None
+
+    previous_evidence = _last_assistant_evidence(chat_history)
+    if len(previous_evidence) < 2:
+        return None
+
+    evidence = _renumber_evidence(previous_evidence)
+    subject = _infer_count_subject(previous_user_question)
+    citation_text = " ".join(f"[{item['id']}]" for item in evidence)
+    answer = f"Son {len(evidence)} {subject} en total {citation_text}."
+    diagnostics.update(
+        {
+            "retrieval_mode": "count_follow_up",
+            "citation_mode": "count_from_previous_answer",
+            "cited_ids": [item["id"] for item in evidence],
+        }
+    )
+    return RetrievalResult(
+        answer=answer,
+        evidence=evidence,
+        diagnostics=diagnostics,
     )
 
 
@@ -689,7 +760,28 @@ def _extract_query_rows(question: str) -> set[int]:
 
 def _normalize_date_value(value: str) -> str:
     normalized = value.strip().replace("/", "-")
-    return normalized if DATE_PATTERN.fullmatch(normalized) else ""
+    if not DATE_PATTERN.fullmatch(normalized):
+        return ""
+
+    parts = normalized.split("-")
+    if len(parts) != 3 or not all(part.isdigit() for part in parts):
+        return ""
+
+    if len(parts[0]) == 4:
+        year, month, day = parts
+    elif len(parts[2]) == 4:
+        day, month, year = parts
+    else:
+        return ""
+
+    try:
+        return date(int(year), int(month), int(day)).isoformat()
+    except ValueError:
+        return ""
+
+
+def _contains_date_like_token(value: str) -> bool:
+    return bool(DATE_PATTERN.search(value))
 
 
 def _normalize_lookup_token(value: str) -> str:
@@ -837,6 +929,7 @@ def _enrich_structured_xlsx_question(
         return question
 
     current_dates = _extract_query_dates(question)
+    current_has_date_token = _contains_date_like_token(question)
     current_rows = _extract_query_rows(question)
     current_columns = _extract_query_columns(question, available_columns)
 
@@ -848,7 +941,7 @@ def _enrich_structured_xlsx_question(
     inherited_columns: list[str] = []
 
     for previous_question in _recent_user_questions(chat_history):
-        if not current_dates:
+        if not current_dates and not current_has_date_token:
             inherited_dates = _extract_query_dates(previous_question)
         if not current_rows:
             inherited_rows = _extract_query_rows(previous_question)
@@ -862,7 +955,7 @@ def _enrich_structured_xlsx_question(
         return question
 
     hint_parts = [question]
-    if not current_dates:
+    if not current_dates and not current_has_date_token:
         hint_parts.extend(f"fecha {value}" for value in sorted(inherited_dates))
     if not current_rows:
         hint_parts.extend(f"fila {value}" for value in sorted(inherited_rows))
@@ -880,6 +973,11 @@ def _is_follow_up_question(question: str) -> bool:
         return True
 
     return len(_extract_query_terms(question)) <= 2
+
+
+def _is_count_follow_up(question: str) -> bool:
+    normalized_question = _normalize_free_text(question)
+    return any(hint in normalized_question for hint in COUNT_FOLLOW_UP_HINTS)
 
 
 def _recent_user_questions(chat_history: list[dict]) -> list[str]:
@@ -903,6 +1001,33 @@ def _last_assistant_answer(chat_history: list[dict]) -> str:
         if content:
             return content
     return ""
+
+
+def _last_assistant_evidence(chat_history: list[dict]) -> list[dict]:
+    for message in reversed(chat_history):
+        if message.get("role") != "assistant":
+            continue
+        evidence = message.get("evidence")
+        if isinstance(evidence, list) and evidence:
+            return evidence
+    return []
+
+
+def _infer_count_subject(previous_user_question: str) -> str:
+    normalized_question = _normalize_free_text(previous_user_question)
+    if "finalidades" in normalized_question:
+        return "finalidades"
+    if "derechos" in normalized_question:
+        return "derechos"
+    if "opciones" in normalized_question:
+        return "opciones"
+    if "situaciones" in normalized_question:
+        return "situaciones"
+    if "alternativas" in normalized_question:
+        return "alternativas"
+    if "casos" in normalized_question:
+        return "casos"
+    return "elementos"
 
 
 def _format_chat_history(chat_history: list[dict]) -> str:
@@ -1039,9 +1164,79 @@ def _expand_txt_neighbor_matches(
     return expanded_matches[:limit]
 
 
+def _expand_semantic_neighbor_pairs(
+    question: str,
+    selected_pairs: list[tuple[Document, float]],
+    source_documents: list[Document],
+    *,
+    limit: int,
+) -> list[tuple[Document, float]]:
+    if not selected_pairs or not source_documents or not _is_enumeration_question(question):
+        return selected_pairs
+
+    documents_by_key = {
+        (document.metadata.get("source"), document.metadata.get("element_index")): document
+        for document in source_documents
+        if document.metadata.get("file_type") in {"pdf", "docx"}
+        and isinstance(document.metadata.get("element_index"), int)
+    }
+    if not documents_by_key:
+        return selected_pairs
+
+    expanded_pairs: list[tuple[Document, float]] = []
+    seen_keys: set[tuple[str | None, int | None]] = set()
+
+    for document, score in selected_pairs:
+        current_key = (document.metadata.get("source"), document.metadata.get("element_index"))
+        if current_key not in seen_keys:
+            expanded_pairs.append((document, score))
+            seen_keys.add(current_key)
+
+        if document.metadata.get("file_type") not in {"pdf", "docx"}:
+            continue
+
+        element_index = document.metadata.get("element_index")
+        source = document.metadata.get("source")
+        if not isinstance(element_index, int):
+            continue
+
+        content = document.page_content.strip()
+        if not content.endswith(":"):
+            continue
+
+        for offset in range(1, 13):
+            neighbor_key = (source, element_index + offset)
+            if neighbor_key in seen_keys:
+                continue
+            neighbor = documents_by_key.get(neighbor_key)
+            if neighbor is None:
+                break
+            neighbor_content = neighbor.page_content.strip()
+            if offset > 1 and _looks_like_new_section(neighbor_content):
+                break
+            expanded_pairs.append((neighbor, max(score - (offset * 0.05), 0.1)))
+            seen_keys.add(neighbor_key)
+            if len(expanded_pairs) >= limit:
+                return expanded_pairs[:limit]
+
+    return expanded_pairs[:limit]
+
+
 def _clean_txt_section_title(title: str) -> str:
     cleaned = re.sub(r"^\d+[.)]\s*", "", title).strip()
     return cleaned.rstrip(":").strip()
+
+
+def _looks_like_new_section(content: str) -> bool:
+    normalized_content = _normalize_free_text(content).strip()
+    if not normalized_content or len(normalized_content) < 20:
+        return False
+    if ":" in normalized_content[:60] and not normalized_content.endswith(":"):
+        return True
+    first_sentence, separator, _ = normalized_content.partition(". ")
+    if separator and len(first_sentence.split()) <= 10:
+        return True
+    return False
 
 
 def _describe_txt_section(title: str) -> str:
@@ -1072,6 +1267,8 @@ def _build_evidence(
                 "metric_label": metric_label,
                 "metric_value": round(float(metric_value), 3),
                 "content": document.page_content,
+                "file_type": document.metadata.get("file_type"),
+                "element_index": document.metadata.get("element_index"),
             }
         )
     return evidence
@@ -1215,22 +1412,56 @@ def _extract_enumeration_anchor_terms(question: str) -> set[str]:
 def _select_enumeration_candidates(evidence: list[dict], anchor_terms: set[str]) -> list[dict]:
     selected: list[dict] = []
     seen_contents: set[str] = set()
+    last_anchor_source: str | None = None
+    last_anchor_index: int | None = None
+    include_following = 0
 
     for item in evidence:
         content = str(item.get("content", "")).strip()
         normalized_content = _normalize_free_text(content)
         if not content or normalized_content in seen_contents:
             continue
-        if _lexical_overlap_with_terms(anchor_terms, content) <= 0:
+        item_source = str(item.get("source", ""))
+        item_index = item.get("element_index")
+        is_anchor = _lexical_overlap_with_terms(anchor_terms, content) > 0
+        is_following_item = (
+            include_following > 0
+            and item_source == last_anchor_source
+            and isinstance(item_index, int)
+            and isinstance(last_anchor_index, int)
+            and item_index == last_anchor_index + 1
+        )
+        if not is_anchor and not is_following_item:
+            include_following = 0
             continue
-        if len(content) < 12 or len(content) > 220:
+        if is_anchor and content.endswith(":"):
+            last_anchor_source = item_source
+            last_anchor_index = item_index if isinstance(item_index, int) else None
+            include_following = 10
+            if not is_following_item:
+                continue
+        if len(content) < 12 or len(content) > 400:
+            if is_following_item:
+                last_anchor_index = item_index
+                include_following = max(include_following - 1, 0)
             continue
         if "@" in content or "http" in normalized_content:
+            if is_following_item:
+                last_anchor_index = item_index
+                include_following = max(include_following - 1, 0)
             continue
         if any(normalized_content.startswith(prefix) for prefix in ENUMERATION_EXCLUDE_PREFIXES):
+            if is_following_item:
+                last_anchor_index = item_index
+                include_following = max(include_following - 1, 0)
             continue
         seen_contents.add(normalized_content)
         selected.append(item)
+        if is_following_item:
+            last_anchor_index = item_index
+            include_following = max(include_following - 1, 0)
+        else:
+            include_following = 0
 
     return selected
 

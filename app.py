@@ -371,7 +371,10 @@ def _build_chat_history(messages: list[dict], max_turns: int) -> list[dict]:
             continue
         if role == "assistant" and content == WELCOME_MESSAGE:
             continue
-        filtered_messages.append({"role": role, "content": content})
+        history_message = {"role": role, "content": content}
+        if role == "assistant" and isinstance(message.get("evidence"), list):
+            history_message["evidence"] = message["evidence"]
+        filtered_messages.append(history_message)
 
     if not filtered_messages:
         return []
