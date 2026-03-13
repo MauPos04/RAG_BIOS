@@ -1,30 +1,35 @@
 # RAG BIOS
 
-Aplicacion web tipo chat para cargar documentos y hacer preguntas usando un flujo RAG con respuestas basadas unicamente en la evidencia recuperada.
+Aplicacion web tipo chat para cargar documentos y realizar preguntas sobre su contenido mediante un flujo RAG con respuestas basadas unicamente en la evidencia recuperada.
 
 ## Objetivo
 
-La solucion fue construida para cumplir la prueba tecnica de Analista IA:
+La solucion implementa un asistente RAG para consulta documental que:
 
-- soporta PDF, DOCX, XLSX y TXT
-- ofrece una interfaz simple tipo chat
-- responde solo con base en el contenido cargado
-- se abstiene o advierte cuando no hay suficiente soporte en la evidencia
+- soporta `PDF`, `DOCX`, `XLSX` y `TXT`,
+- ofrece una interfaz web simple tipo chat,
+- responde solo con base en el contenido cargado,
+- muestra evidencia visible para cada respuesta,
+- se abstiene cuando no existe soporte suficiente en los documentos.
 
 ## Arquitectura
 
-El flujo general es:
+El flujo general es el siguiente:
 
 1. El usuario carga uno o varios archivos desde Streamlit.
-2. El sistema extrae texto de PDF, DOCX y TXT con `unstructured`.
-3. Los archivos XLSX se procesan con `openpyxl` fila por fila y se enriquecen con metadata tabular.
-4. PDF, DOCX y TXT se dividen en chunks con `RecursiveCharacterTextSplitter`.
-5. Las filas de XLSX se mantienen intactas para no romper el contexto tabular.
-6. El contenido se indexa en FAISS usando embeddings locales de Hugging Face.
-7. Para cada pregunta, el sistema intenta primero un lookup estructurado si detecta una consulta tabular sobre Excel.
-8. Si no aplica el lookup estructurado, usa retrieval semantico por distancia y envia solo los mejores `TOP_K` al modelo.
-9. El modelo de OpenRouter responde con un prompt restrictivo que lo obliga a usar solo el contexto recuperado.
-10. La interfaz muestra la respuesta y los fragmentos fuente usados como evidencia.
+2. El sistema normaliza cada archivo segun su formato:
+   - `PDF` y `DOCX`: extraccion textual con `unstructured`
+   - `TXT`: segmentacion por secciones
+   - `XLSX`: modelado por filas con metadata tabular
+3. `PDF`, `DOCX` y `TXT` se fragmentan en chunks cuando corresponde.
+4. Las filas de `XLSX` se mantienen intactas para preservar el contexto tabular.
+5. El contenido se indexa en FAISS usando embeddings locales de Hugging Face.
+6. Para cada pregunta, el sistema decide si aplica una ruta estructurada o retrieval semantico general:
+   - lookup estructurado para consultas tabulares sobre `XLSX`
+   - lookup estructurado por secciones para ciertas consultas sobre `TXT`
+   - retrieval semantico general para preguntas sobre `PDF`, `DOCX` y consultas no estructuradas
+7. El modelo de OpenRouter genera la respuesta usando solo el contexto recuperado.
+8. La respuesta se valida, se citan evidencias y la interfaz muestra los fragmentos fuente utilizados.
 
 ## Estructura del proyecto
 
@@ -33,19 +38,21 @@ RAG_BIOS/
 |-- app.py
 |-- README.md
 |-- README2.md
+|-- COMO_FUNCIONA.md
+|-- DEMO_GUIA.md
+|-- PREGUNTAS_PRUEBA.md
 |-- pyproject.toml
 |-- uv.lock
 |-- .env.example
 `-- src/
     `-- rag_bios/
         |-- __init__.py
+        |-- cache_store.py
         |-- config.py
         |-- document_loader.py
         |-- pipeline.py
         `-- prompts.py
 ```
-
-`README2.md` complementa este documento con diagramas y una explicacion mas detallada del flujo.
 
 ## Instrucciones de ejecucion
 
@@ -56,12 +63,24 @@ RAG_BIOS/
 uv venv
 ```
 
-3. Activar el entorno virtual.
+3. Activar el entorno virtual segun el sistema operativo.
 
 En Windows PowerShell:
 
 ```bash
 .venv\Scripts\activate
+```
+
+En macOS:
+
+```bash
+source .venv/bin/activate
+```
+
+En Linux:
+
+```bash
+source .venv/bin/activate
 ```
 
 4. Instalar dependencias bloqueadas por `uv.lock`:
@@ -82,71 +101,77 @@ streamlit run app.py
 - `pyproject.toml` define las dependencias del proyecto.
 - `uv.lock` fija las versiones exactas para mantener un entorno reproducible.
 - `uv sync` instala exactamente lo definido en el lockfile.
-- Si cambias dependencias, actualiza el lockfile con `uv lock`.
+- Si cambian dependencias, el lockfile puede actualizarse con `uv lock`.
 
 ## Variables principales
 
 - `OPENROUTER_API_KEY`: clave de acceso al modelo.
 - `OPENROUTER_MODEL`: modelo a usar en OpenRouter.
 - `OPENROUTER_BASE_URL`: endpoint del proveedor.
-- `OPENROUTER_HTTP_REFERER`: cabecera usada por OpenRouter; en local puede apuntar a tu instancia de Streamlit.
+- `OPENROUTER_HTTP_REFERER`: cabecera usada por OpenRouter.
 - `OPENROUTER_X_TITLE`: titulo enviado al proveedor.
 - `EMBEDDING_MODEL`: modelo local para embeddings.
 - `CHUNK_SIZE`: tamano del chunk para indexacion.
 - `CHUNK_OVERLAP`: solapamiento entre chunks.
 - `TOP_K`: cantidad final de fragmentos que se envian al modelo en cada pregunta.
-- `RETRIEVAL_MULTIPLIER`: cantidad de candidatos extra que se recuperan localmente antes de reordenar por distancia y recortar a `TOP_K`.
-- `REQUIRE_CITATIONS`: intenta exigir citas como `[E1]`, `[E2]`; si faltan, la app muestra advertencia y evidencia recuperada.
-- `TEMPERATURE`: temperatura del modelo; se recomienda `0.0` para reducir variabilidad.
+- `RETRIEVAL_MULTIPLIER`: cantidad de candidatos extra recuperados localmente antes de recortar a `TOP_K`.
+- `REQUIRE_CITATIONS`: habilita el control de citas como `[E1]`, `[E2]`.
+- `TEMPERATURE`: temperatura del modelo.
+- `DOCUMENT_LANGUAGES`: idiomas usados por `unstructured` para `PDF` y `DOCX`.
+- `PERSISTENT_INDEX_CACHE`: activa cache persistente del procesamiento documental.
+- `INDEX_CACHE_DIR`: directorio del cache persistente.
+- `CHAT_MEMORY_TURNS`: cantidad de turnos recientes usados para follow-ups controlados.
 
 ## Decisiones tecnicas
 
-- Se eligio Streamlit para acelerar la entrega y dejar una interfaz clara para demo.
-- Se eligio OpenRouter como backend principal por flexibilidad de modelos.
-- Los embeddings se calculan localmente para no depender de una segunda API.
-- FAISS se mantiene en memoria durante la sesion para simplificar el MVP.
-- XLSX se procesa aparte para representar cada fila como evidencia recuperable con hoja y numero de fila.
-- Las preguntas exactas de Excel como `fecha + columna` o `fila + columna` usan un lookup estructurado primero, porque para tablas anchas es mas confiable que depender solo de embeddings.
-- Las filas de Excel no se trocean en chunks para evitar perder relaciones entre columnas de una misma fila.
-- La respuesta se restringe mediante prompt, evidencia recuperada visible en pantalla y advertencias si el modelo no cita bien.
+- Se eligio Streamlit para ofrecer una interfaz web simple y mantenible.
+- Se eligio OpenRouter como backend principal por flexibilidad en la seleccion del modelo.
+- Los embeddings se calculan localmente para no depender de una segunda API remota.
+- FAISS se usa como indice vectorial local para retrieval semantico.
+- `XLSX` se procesa por fila para representar mejor la estructura tabular.
+- Las preguntas tabulares exactas usan lookup estructurado antes del retrieval semantico.
+- `TXT` se segmenta por secciones para preservar comandos y pasos operativos.
+- La respuesta se restringe mediante prompt, evidencia visible y validacion posterior de citas.
+- El sistema incorpora cache persistente opcional para reducir tiempos de reprocesamiento.
 
 ## Como se reduce la alucinacion
 
 - El prompt indica que la respuesta solo puede basarse en el contexto recuperado.
-- El sistema recupera candidatos localmente, los ordena por distancia vectorial y solo envia al modelo los mejores `TOP_K`.
-- En XLSX, antes del retrieval semantico se intenta resolver preguntas tabulares con un lookup estructurado sobre metadata de fila, fecha y columnas.
-- Si el contexto recuperado no soporta la pregunta, el modelo debe responder: `No encontre esa informacion en los documentos cargados.`
-- Si el modelo no devuelve citas validas, la app mantiene la evidencia recuperada visible y marca la respuesta con advertencia.
-- La interfaz muestra los fragmentos recuperados para inspeccion manual.
+- El sistema recupera evidencia localmente y solo envia al modelo los fragmentos mas relevantes.
+- En `XLSX`, se intenta primero resolver preguntas tabulares exactas por metadata estructurada.
+- En `TXT`, ciertas preguntas pueden resolverse a partir de secciones especificas.
+- Si el contexto recuperado no soporta la pregunta, el sistema se abstiene.
+- Si las citas no son validas, la interfaz conserva la evidencia recuperada para inspeccion.
+- La evidencia utilizada se muestra en pantalla para auditoria manual.
 
 ## Costo y tokens
 
-- `RETRIEVAL_MULTIPLIER` no incrementa directamente el costo de OpenRouter porque la sobre recuperacion y el reordenamiento ocurren en FAISS de forma local.
-- El costo remoto lo dominan sobre todo `TOP_K`, `CHUNK_SIZE` y la longitud real de los fragmentos enviados al modelo.
-- Las citas agregan un overhead pequeno de tokens porque la respuesta incluye etiquetas como `[E1]` y el contexto lleva identificadores de evidencia.
-- En la configuracion actual, el sistema puede buscar mas candidatos localmente sin enviar todos esos candidatos al LLM.
+- La sobre recuperacion no incrementa directamente el costo del LLM porque ocurre en FAISS local.
+- El costo remoto depende sobre todo de `TOP_K`, `CHUNK_SIZE` y del tamano real del contexto enviado.
+- El lookup estructurado de `XLSX` puede reducir costo al evitar contexto innecesario.
+- Las citas agregan un overhead pequeno de tokens en comparacion con enviar mas contexto.
 
 ## Ajuste recomendado de costo vs precision
 
-- Si quieres bajar costo, reduce `TOP_K` antes de tocar `RETRIEVAL_MULTIPLIER`.
-- Si quieres mantener precision sin disparar tokens, deja `TOP_K` bajo y usa `RETRIEVAL_MULTIPLIER` para refinar la seleccion local.
-- Para Excel, antes de subir `TOP_K`, revisa si la pregunta puede expresarse como `fecha + columna`; ese camino suele ser mas preciso y mas barato que forzar mas contexto al LLM.
-- Un punto de partida razonable para demo es `TOP_K=6`, `RETRIEVAL_MULTIPLIER=3`, `CHUNK_SIZE=1000`, `CHUNK_OVERLAP=200` y `TEMPERATURE=0.0`.
+- Para reducir costo, conviene ajustar `TOP_K` antes de modificar `RETRIEVAL_MULTIPLIER`.
+- Para mantener precision sin aumentar tokens, conviene mantener `TOP_K` moderado y refinar la seleccion local.
+- Para `XLSX`, antes de aumentar `TOP_K`, conviene reformular la pregunta en formato `fecha + columna`.
+- Configuracion de referencia: `TOP_K=6`, `RETRIEVAL_MULTIPLIER=3`, `CHUNK_SIZE=1000`, `CHUNK_OVERLAP=200` y `TEMPERATURE=0.0`.
 
 ## Posibles mejoras futuras
 
-- Persistencia del indice vectorial entre sesiones.
+- Ajustes adicionales para preguntas ambiguas o de seguimiento complejo.
 - Normalizacion adicional de encabezados y sinonimos para columnas de Excel.
-- Ajustes especificos para TXT cortos o notas semi estructuradas.
 - Metricas de evaluacion automatica para grounding.
 - Citas mas precisas por pagina, celda o seccion.
+- Mejor soporte para documentos escaneados.
 - Soporte multiusuario.
 
-## Guia corta para demo
+## Guia de validacion funcional
 
-1. Cargar un PDF o DOCX con informacion conocida.
+1. Cargar un `PDF` o `DOCX` con informacion conocida.
 2. Hacer una pregunta cuya respuesta este claramente en el documento.
 3. Mostrar la respuesta y abrir los fragmentos fuente.
 4. Hacer una pregunta fuera del contenido.
-5. Mostrar que el sistema responde que no encontro la informacion.
-6. Repetir con un XLSX para probar el cuarto formato exigido.
+5. Mostrar que el sistema responde con abstencion controlada.
+6. Repetir con un `XLSX` y un `TXT` para validar los cuatro formatos soportados.

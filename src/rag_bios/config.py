@@ -75,6 +75,9 @@ class Settings:
     temperature: float
     log_level: str
     document_languages: list[str]
+    persistent_index_cache: bool
+    index_cache_dir: str
+    chat_memory_turns: int
 
 
 def load_settings() -> Settings:
@@ -104,6 +107,13 @@ def load_settings() -> Settings:
         temperature=_parse_float("TEMPERATURE", 0.0, minimum=0.0, maximum=2.0),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper().strip(),
         document_languages=_parse_csv_list("DOCUMENT_LANGUAGES", ["spa", "eng"]),
+        persistent_index_cache=_parse_bool(
+            os.getenv("PERSISTENT_INDEX_CACHE", "true"),
+            default=True,
+        ),
+        index_cache_dir=os.getenv("INDEX_CACHE_DIR", ".rag_cache/indexes").strip()
+        or ".rag_cache/indexes",
+        chat_memory_turns=_parse_int("CHAT_MEMORY_TURNS", 3, minimum=0),
     )
 
     if settings.chunk_overlap >= settings.chunk_size:
